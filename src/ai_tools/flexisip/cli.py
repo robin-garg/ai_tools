@@ -131,12 +131,15 @@ def _sep(width: int = 100) -> None:
     click.echo("-" * width)
 
 
-def _print_report(server_name: str, regs: list) -> None:
+def _print_report(server_name: str, regs: list, filters: dict | None = None) -> None:
     now_utc = datetime.now(tz=timezone.utc)
     now_ist = now_utc.astimezone(IST)
 
+    active = {k: v for k, v in (filters or {}).items() if v}
+    filters_label = ("  |  Filters: " + "  ".join(f"{k}={v}" for k, v in active.items())) if active else ""
+
     click.echo("")
-    click.echo(f"Registration Report  —  {server_name}")
+    click.echo(f"Registration Report  —  {server_name}{filters_label}")
     click.echo(f"Report time : {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
                f"  /  {now_ist.strftime('%Y-%m-%d %H:%M:%S')} IST")
     click.echo(f"Total       : {len(regs)} registered device(s)")
@@ -180,18 +183,42 @@ def _print_report(server_name: str, regs: list) -> None:
     help="Target server (stg2 or stg2b).",
 )
 @click.option(
+    "--platform", "-pl",
+    type=click.Choice(["ios", "android"], case_sensitive=False),
+    default=None,
+    help="Filter by device platform: ios or android.",
+)
+@click.option(
+    "--domain", "-d",
+    default=None,
+    help="Filter by domain (substring match on first two domain labels, e.g. 'bdaprthirteen').",
+)
+@click.option(
     "--pattern", "-p",
     default="fs:*",
     show_default=True,
-    help="Redis key pattern to filter registrations.",
+    help="Redis key pattern (advanced). Defaults to all registrations.",
 )
-def registrations(server: str, pattern: str) -> None:
-    """Show a clean registration report for all registered devices."""
+def registrations(server: str, platform: str | None, domain: str | None, pattern: str) -> None:
+    """Show a clean registration report for all registered devices.
+
+    Use --platform to filter by iOS or Android.
+    Use --domain to filter by domain name (partial match).
+    Both filters can be combined.
+    """
     srv = get_server(server)
     click.echo(f"connecting to {srv.name} ({srv.redis_host})...", err=True)
+
     with connect(srv) as client:
         regs = list_registrations(client, pattern=pattern)
-    _print_report(srv.name, regs)
+
+    # Apply filters
+    if platform:
+        regs = [r for r in regs if r.platform.lower() == platform.lower()]
+    if domain:
+        regs = [r for r in regs if domain.lower() in r.domain_short.lower()]
+
+    _print_report(srv.name, regs, filters={"platform": platform, "domain": domain})
 
 
 @click.group()

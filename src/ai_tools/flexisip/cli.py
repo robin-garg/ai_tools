@@ -13,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 
 import click
 
+from ai_tools.flexisip.docker_utils import find_proxy_container, list_containers
+from ai_tools.flexisip.log_extractor import extract_and_save
 from ai_tools.flexisip.registrar import (
     connect,
     count_keys,
@@ -239,6 +241,132 @@ def user(server: str, username: str) -> None:
         click.echo(f"No registration found for user '{username}' on {srv.name}", err=True)
         sys.exit(1)
     _print_report(srv.name, regs, filters={"user": username})
+
+
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+def containers(server: str) -> None:
+    """List running Docker containers on the target server."""
+    srv = get_server(server)
+    click.echo(f"listing containers on {srv.name}...", err=True)
+    found = list_containers(srv)
+    if not found:
+        click.echo(f"No running containers on {srv.name}.")
+        return
+    w_name = max(len(c.name) for c in found)
+    w_img = max(len(c.image) for c in found)
+    click.echo(f"{'NAME':<{w_name}}  {'IMAGE':<{w_img}}  STATUS")
+    _sep()
+    for c in found:
+        click.echo(f"{c.name:<{w_name}}  {c.image:<{w_img}}  {c.status}")
+
+
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.option(
+    "--call-id", "-c",
+    "call_id",
+    default=None,
+    help="Filter logs by SIP Call-ID.",
+)
+@click.option(
+    "--user", "-u",
+    multiple=True,
+    help="Filter logs by user extension (matched anywhere in the block). "
+         "Repeat the flag to match multiple users, e.g. -u 49810 -u 1a97435c96ba.",
+)
+@click.option(
+    "--start",
+    default=None,
+    help="Start timestamp, UTC, 'YYYY-MM-DD HH:MM:SS'.",
+)
+@click.option(
+    "--end",
+    default=None,
+    help="End timestamp, UTC, 'YYYY-MM-DD HH:MM:SS'.",
+)
+@click.option(
+    "--print/--no-print", "print_content",
+    default=False,
+    help="Also print extracted logs to stdout.",
+)
+def logs(
+    server: str,
+    call_id: str | None,
+    user: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    print_content: bool,
+) -> None:
+    """Extract Flexisip proxy call logs and save them under logs/.
+
+    At least one filter (--call-id, --user, or --start/--end) must be given.
+    --user may be repeated to match blocks mentioning any of the given users.
+    """
+    if not any([call_id, user, start, end]):
+        click.echo("Provide at least one of --call-id, --user, --start/--end.", err=True)
+        sys.exit(2)
+
+    srv = get_server(server)
+    click.echo(f"resolving proxy container on {srv.name}...", err=True)
+    container = find_proxy_container(srv)
+    click.echo(f"using container: {container.name}", err=True)
+
+    if call_id:
+        pattern = call_id
+        descriptor = f"callid-{call_id[:12]}"
+    elif user:
+        # OR-match any of the provided users via awk/ERE alternation.
+        pattern = "|".join(user)
+        descriptor = (
+            f"user-{user[0]}" if len(user) == 1
+            else f"users-{user[0]}+{len(user) - 1}"
+        )
+    else:
+        pattern = ""
+        descriptor = f"range-{(start or 'open').replace(' ', 'T')}"
+
+    click.echo("extracting logs...", err=True)
+    result = extract_and_save(
+        srv,
+        container.name,
+        descriptor=descriptor,
+        pattern=pattern,
+        start=start or "",
+        end=end or "",
+    )
+
+    click.echo("")
+    click.echo(f"Server    : {result.server}")
+    click.echo(f"Container : {result.container}")
+    active = {k: v for k, v in result.filters.items() if v}
+    if active:
+        click.echo("Filters   : " + "  ".join(f"{k}={v}" for k, v in active.items()))
+    if result.filters.get("pattern"):
+        click.echo(f"Blocks    : {result.total_blocks} total  "
+                   f"({result.matched_blocks} matched + "
+                   f"{result.total_blocks - result.matched_blocks} context)")
+    else:
+        click.echo(f"Blocks    : {result.total_blocks}")
+    if result.saved_to is not None:
+        click.echo(f"Saved to  : {result.saved_to}")
+    else:
+        click.echo("Saved to  : (nothing matched — no file written)")
+
+    if print_content and result.content:
+        click.echo("")
+        _sep()
+        click.echo(result.content)
 
 
 @click.group()

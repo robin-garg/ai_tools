@@ -1,0 +1,206 @@
+"""Command-line interface for the Flexisip registration tools.
+
+Designed for simple, low-noise output suitable for both human reading and AI
+analysis. No colour or box-drawing; each record is printed as aligned
+`key: value` lines with blank separators between records.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from datetime import datetime, timezone, timedelta
+
+import click
+
+from ai_tools.flexisip.registrar import (
+    connect,
+    count_keys,
+    get_entry,
+    list_registrations,
+    sample_entries,
+)
+from ai_tools.flexisip.servers import SERVERS, get_server
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+SERVER_CHOICE = click.Choice(sorted(SERVERS), case_sensitive=False)
+
+
+def _format_entry(key: str, entry: dict[str, str] | None) -> str:
+    if entry is None:
+        return f"key: {key}\n  (missing)"
+    lines = [f"key: {key}"]
+    if "__type__" in entry:
+        lines.append(f"  type: {entry['__type__']} (non-hash key, skipped)")
+        return "\n".join(lines)
+    width = max((len(f) for f in entry), default=0)
+    for field, value in entry.items():
+        lines.append(f"  {field.ljust(width)}  {value}")
+    return "\n".join(lines)
+
+
+@click.group()
+def flexisip() -> None:
+    """Inspect Flexisip registrations via Redis."""
+
+
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.option(
+    "--pattern", "-p",
+    default="*",
+    show_default=True,
+    help="Redis key pattern to match.",
+)
+def count(server: str, pattern: str) -> None:
+    """Count registration keys matching a pattern."""
+    srv = get_server(server)
+    click.echo(f"connecting to {srv.name} ({srv.redis_host})...", err=True)
+    with connect(srv) as client:
+        total = count_keys(client, pattern)
+    click.echo(f"server:  {srv.name}")
+    click.echo(f"pattern: {pattern}")
+    click.echo(f"count:   {total}")
+
+
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.option(
+    "--pattern", "-p",
+    default="*",
+    show_default=True,
+    help="Redis key pattern to match.",
+)
+@click.option(
+    "-n", "--limit",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+    help="Number of entries to show.",
+)
+def inspect(server: str, pattern: str, limit: int) -> None:
+    """Show the raw HGETALL contents of the first N matching keys."""
+    srv = get_server(server)
+    click.echo(f"connecting to {srv.name} ({srv.redis_host})...", err=True)
+    with connect(srv) as client:
+        entries = sample_entries(client, limit=limit, pattern=pattern)
+    if not entries:
+        click.echo(f"no keys matched pattern '{pattern}' on {srv.name}")
+        return
+    click.echo(f"server: {srv.name}")
+    click.echo(f"showing {len(entries)} of pattern '{pattern}':")
+    click.echo("")
+    for key, entry in entries:
+        click.echo(_format_entry(key, entry))
+        click.echo("")
+
+
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.argument("key")
+def show(server: str, key: str) -> None:
+    """Show the HGETALL contents of a specific key."""
+    srv = get_server(server)
+    click.echo(f"connecting to {srv.name} ({srv.redis_host})...", err=True)
+    with connect(srv) as client:
+        entry = get_entry(client, key)
+    if entry is None:
+        click.echo(f"key not found: {key}", err=True)
+        sys.exit(1)
+    click.echo(_format_entry(key, entry))
+
+
+def _sep(width: int = 100) -> None:
+    click.echo("-" * width)
+
+
+def _print_report(server_name: str, regs: list) -> None:
+    now_utc = datetime.now(tz=timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+
+    click.echo("")
+    click.echo(f"Registration Report  —  {server_name}")
+    click.echo(f"Report time : {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+               f"  /  {now_ist.strftime('%Y-%m-%d %H:%M:%S')} IST")
+    click.echo(f"Total       : {len(regs)} registered device(s)")
+    _sep()
+
+    if not regs:
+        click.echo("No registrations found.")
+        return
+
+    # Column widths
+    W_USER   = max(len(r.user)          for r in regs)
+    W_DOM    = max(len(r.domain_short)  for r in regs)
+    W_PLAT   = max(len(r.platform)      for r in regs)
+    W_IP     = max(len(r.ip_port)       for r in regs)
+    W_SINCE  = 14  # "X hr Y mins ago"
+
+    # Header
+    click.echo(
+        f"{'User':<{W_USER}}  {'Domain':<{W_DOM}}  {'Platform':<{W_PLAT}}"
+        f"  {'IP : Port':<{W_IP}}"
+        f"  {'Updated (UTC)':<19}  {'Updated (IST)':<19}  Since"
+    )
+    _sep()
+
+    for r in sorted(regs, key=lambda x: x.updated_utc, reverse=True):
+        click.echo(
+            f"{r.user:<{W_USER}}  {r.domain_short:<{W_DOM}}  {r.platform:<{W_PLAT}}"
+            f"  {r.ip_port:<{W_IP}}"
+            f"  {r.updated_utc.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"  {r.updated_ist.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"  {r.mins_ago_label}"
+        )
+    _sep()
+
+
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.option(
+    "--pattern", "-p",
+    default="fs:*",
+    show_default=True,
+    help="Redis key pattern to filter registrations.",
+)
+def registrations(server: str, pattern: str) -> None:
+    """Show a clean registration report for all registered devices."""
+    srv = get_server(server)
+    click.echo(f"connecting to {srv.name} ({srv.redis_host})...", err=True)
+    with connect(srv) as client:
+        regs = list_registrations(client, pattern=pattern)
+    _print_report(srv.name, regs)
+
+
+@click.group()
+def cli() -> None:
+    """ai-tools: personal tools for daily work."""
+
+
+cli.add_command(flexisip)
+
+
+if __name__ == "__main__":
+    cli()

@@ -221,6 +221,26 @@ def registrations(server: str, platform: str | None, domain: str | None, pattern
     _print_report(srv.name, regs, filters={"platform": platform, "domain": domain})
 
 
+@flexisip.command()
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.argument("username")
+def user(server: str, username: str) -> None:
+    """Show registration details for a specific USERNAME."""
+    srv = get_server(server)
+    click.echo(f"connecting to {srv.name} ({srv.redis_host})...", err=True)
+    with connect(srv) as client:
+        regs = list_registrations(client, pattern=f"fs:{username}*")
+    if not regs:
+        click.echo(f"No registration found for user '{username}' on {srv.name}", err=True)
+        sys.exit(1)
+    _print_report(srv.name, regs, filters={"user": username})
+
+
 @click.group()
 def cli() -> None:
     """ai-tools: personal tools for daily work."""

@@ -296,9 +296,9 @@ def containers(server: str) -> None:
     help="End timestamp, UTC, 'YYYY-MM-DD HH:MM:SS'.",
 )
 @click.option(
-    "--print/--no-print", "print_content",
+    "--save/--no-save",
     default=False,
-    help="Also print extracted logs to stdout.",
+    help="Also persist the extracted logs to logs/<server>_<desc>_<utc>.log.",
 )
 def logs(
     server: str,
@@ -306,12 +306,13 @@ def logs(
     user: tuple[str, ...],
     start: str | None,
     end: str | None,
-    print_content: bool,
+    save: bool,
 ) -> None:
-    """Extract Flexisip proxy call logs and save them under logs/.
+    """Extract Flexisip proxy call logs and print them to stdout.
 
     At least one filter (--call-id, --user, or --start/--end) must be given.
     --user may be repeated to match blocks mentioning any of the given users.
+    Use --save to also write the logs to the logs/ directory.
     """
     if not any([call_id, user, start, end]):
         click.echo("Provide at least one of --call-id, --user, --start/--end.", err=True)
@@ -344,29 +345,36 @@ def logs(
         pattern=pattern,
         start=start or "",
         end=end or "",
+        save=save,
     )
 
-    click.echo("")
-    click.echo(f"Server    : {result.server}")
-    click.echo(f"Container : {result.container}")
+    # Summary goes to stderr so stdout stays clean for piping / analysis.
+    click.echo("", err=True)
+    click.echo(f"Server    : {result.server}", err=True)
+    click.echo(f"Container : {result.container}", err=True)
     active = {k: v for k, v in result.filters.items() if v}
     if active:
-        click.echo("Filters   : " + "  ".join(f"{k}={v}" for k, v in active.items()))
+        click.echo("Filters   : " + "  ".join(f"{k}={v}" for k, v in active.items()), err=True)
     if result.filters.get("pattern"):
-        click.echo(f"Blocks    : {result.total_blocks} total  "
-                   f"({result.matched_blocks} matched + "
-                   f"{result.total_blocks - result.matched_blocks} context)")
+        click.echo(
+            f"Blocks    : {result.total_blocks} total  "
+            f"({result.matched_blocks} matched + "
+            f"{result.total_blocks - result.matched_blocks} context)",
+            err=True,
+        )
     else:
-        click.echo(f"Blocks    : {result.total_blocks}")
-    if result.saved_to is not None:
-        click.echo(f"Saved to  : {result.saved_to}")
-    else:
-        click.echo("Saved to  : (nothing matched — no file written)")
+        click.echo(f"Blocks    : {result.total_blocks}", err=True)
+    if save:
+        if result.saved_to is not None:
+            click.echo(f"Saved to  : {result.saved_to}", err=True)
+        else:
+            click.echo("Saved to  : (nothing matched — no file written)", err=True)
+    click.echo("", err=True)
 
-    if print_content and result.content:
-        click.echo("")
-        _sep()
-        click.echo(result.content)
+    if result.content:
+        click.echo(result.content, nl=False)
+    else:
+        click.echo("(no matching log blocks found)", err=True)
 
 
 @click.group()

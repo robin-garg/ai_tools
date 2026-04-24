@@ -166,14 +166,19 @@ def extract_and_save(
     pattern: str = "",
     start: str = "",
     end: str = "",
+    save: bool = False,
     log_path: str = PROXY_LOG_PATH,
     logs_dir: Path = Path("logs"),
 ) -> ExtractResult:
-    """Convenience: extract, save to logs/, and return a summary."""
+    """Extract matching logs, optionally persist to `logs/`, return a summary."""
     content = extract(
         server, container, pattern=pattern, start=start, end=end, log_path=log_path,
     )
-    saved = save_to_logs_dir(content, server.name, descriptor, logs_dir) if content else None
+    saved = (
+        save_to_logs_dir(content, server.name, descriptor, logs_dir)
+        if content and save
+        else None
+    )
     total, matched = _count_blocks(content, pattern)
     return ExtractResult(
         server=server.name,

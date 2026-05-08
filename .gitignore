@@ -130,8 +130,12 @@ Icon
 
 # ===== Logs / Data / Output =====
 # Project-specific: raw log files and generated outputs should NOT be committed
+backups/.stg2b_last_line
 logs/
 *.log
+reports/
+files/
+call_records_ET/
 output/
 outputs/
 tmp/

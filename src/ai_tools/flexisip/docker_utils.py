@@ -1,7 +1,12 @@
 """Discover Docker containers on a remote Flexisip server.
 
-Flexisip deploys two containers per host — `flexisip-proxy` (call routing,
-SIP traffic, registrations) and `flexisip-regevent` (registration events).
+Flexisip deploys two containers per host:
+- `flexisip-proxy`   — call routing, SIP traffic, registrations.  All log
+                       extraction goes through this container.
+- `flexisip-regevent`— schedules background push notifications to keep
+                       devices registered.  It does NOT produce log files;
+                       never use it as a log source.
+
 Container names can drift across deployments, so this module resolves them
 dynamically by listing `docker ps` over SSH.
 

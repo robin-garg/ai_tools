@@ -29,6 +29,11 @@ from ai_tools.flexisip.servers import Server
 
 PROXY_LOG_PATH = "/usr/local/var/log/flexisip/flexisip-proxy.log"
 
+# Flexisip writes registration event-logs directly on the host (not inside
+# a container).  This is the canonical host-level path used by the event-logs
+# CLI command.
+HOST_EVENT_LOG_PATH = "/var/log/flexisip/event-logs"
+
 # awk block-extractor: groups lines starting with a date into a single block
 # ("block" = timestamp line + its continuation lines — SIP bodies, JSON push
 # payloads, etc.). Emits the whole contiguous span of blocks from the first
@@ -117,7 +122,7 @@ def extract(
     start: str = "",
     end: str = "",
     log_path: str = PROXY_LOG_PATH,
-    timeout: float = 60.0,
+    timeout: float = 360.0,
 ) -> str:
     """Return log blocks matching the given filters (raw text)."""
     remote_cmd = (
@@ -169,10 +174,12 @@ def extract_and_save(
     save: bool = False,
     log_path: str = PROXY_LOG_PATH,
     logs_dir: Path = Path("logs"),
+    timeout: float = 360.0,
 ) -> ExtractResult:
     """Extract matching logs, optionally persist to `logs/`, return a summary."""
     content = extract(
-        server, container, pattern=pattern, start=start, end=end, log_path=log_path,
+        server, container, pattern=pattern, start=start, end=end,
+        log_path=log_path, timeout=timeout,
     )
     saved = (
         save_to_logs_dir(content, server.name, descriptor, logs_dir)
@@ -189,3 +196,47 @@ def extract_and_save(
         total_blocks=total,
         matched_blocks=matched,
     )
+
+
+def extract_host_log(
+    server: Server,
+    *,
+    log_path: str = HOST_EVENT_LOG_PATH,
+    pattern: str = "",
+    timeout: float = 120.0,
+) -> str:
+    """Fetch matching lines from a log file on the remote host (no Docker).
+
+    Used for host-level logs such as ``/var/log/flexisip/event-logs`` which
+    Flexisip writes directly to the host filesystem — not inside any container.
+    Logs are always fetched live from the server.
+
+    ``log_path`` may be a file or a directory; ``grep -rE`` handles both.
+    ``pattern`` is an ERE pattern passed to grep (empty → return all lines).
+    """
+    if pattern:
+        # -h suppresses the filename prefix that grep adds when scanning a directory,
+        # so each output line starts directly with the log timestamp.
+        remote_cmd = (
+            f"sudo -n grep -rhE {shlex.quote(pattern)} {shlex.quote(log_path)}"
+            f" 2>/dev/null || true"
+        )
+    else:
+        remote_cmd = (
+            f"sudo -n find {shlex.quote(log_path)} -type f | sort"
+            f" | xargs sudo -n cat 2>/dev/null"
+        )
+
+    result = subprocess.run(
+        ["ssh", server.ssh_alias, remote_cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    # grep exits 1 when no lines match — treat as empty, not an error.
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"ssh {server.ssh_alias} failed ({result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout

@@ -75,6 +75,32 @@ one-off scripts. This keeps them reusable from:
 
 ---
 
+## Flexisip Log Conventions
+
+### Always fetch logs live from the server
+
+Never use locally cached log files unless the user explicitly says to use them.
+Always SSH to the target server and pull logs fresh for every analysis.
+
+### Container roles — which container to use for logs
+
+| Container | Role | Use for logs? |
+| --- | --- | --- |
+| `flexisip-proxy` | SIP call routing, registrations, push relay | **Yes — always use this for container logs** |
+| `flexisip-regevent` | Schedules background push notifications to keep devices alive | **No — it has no log files** |
+
+`flexisip-regevent` only sends periodic push pings to devices; it does not
+produce any log output worth analysing. Never treat it as a log source.
+
+### Log sources by type
+
+| Log type | Location | How to fetch |
+| --- | --- | --- |
+| SIP call / registration proxy logs | Inside `flexisip-proxy` container: `/usr/local/var/log/flexisip/flexisip-proxy.log` | `docker exec` via `log_extractor.extract()` |
+| Registration event-logs | On the **host**: `/var/log/flexisip/event-logs` | Direct SSH via `log_extractor.extract_host_log()` |
+
+---
+
 ## Conventions
 
 - **Package name**: `ai_tools` (snake_case, Python convention)

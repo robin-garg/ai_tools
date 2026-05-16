@@ -27,12 +27,12 @@ from pathlib import Path
 
 from ai_tools.flexisip.servers import Server
 
+# Module-level path constants are kept for backward compatibility and as the
+# fallback when no Server object is available.  Prefer server.proxy_log_path
+# and server.event_log_path when a Server is in scope — those values come from
+# the per-server config in servers.py and are the single source of truth.
 PROXY_LOG_PATH = "/usr/local/var/log/flexisip/flexisip-proxy.log"
-
-# Flexisip writes registration event-logs directly on the host (not inside
-# a container).  This is the canonical host-level path used by the event-logs
-# CLI command.
-HOST_EVENT_LOG_PATH = "/var/log/flexisip/event-logs"
+EVENT_LOG_PATH = "/var/log/flexisip/event-logs"
 
 # awk block-extractor: groups lines starting with a date into a single block
 # ("block" = timestamp line + its continuation lines — SIP bodies, JSON push
@@ -116,22 +116,42 @@ def _count_blocks(text: str, pattern: str) -> tuple[int, int]:
 
 def extract(
     server: Server,
-    container: str,
+    container: str = "",
     *,
     pattern: str = "",
     start: str = "",
     end: str = "",
-    log_path: str = PROXY_LOG_PATH,
+    log_path: str | None = None,
     timeout: float = 360.0,
 ) -> str:
-    """Return log blocks matching the given filters (raw text)."""
-    remote_cmd = (
-        f"sudo -n docker exec {shlex.quote(container)} "
-        f"awk -v pat={shlex.quote(pattern)} "
-        f"-v start={shlex.quote(start)} "
-        f"-v end={shlex.quote(end)} "
-        f"{shlex.quote(_AWK_EXTRACTOR)} {shlex.quote(log_path)}"
-    )
+    """Return log blocks matching the given filters (raw text).
+
+    Routing is determined by ``server.proxy_log_in_container``:
+
+    * ``True``  — the proxy log lives inside a Docker/Podman container; the log
+                  is read via ``docker exec <container> awk …``.  ``container``
+                  must be non-empty.
+    * ``False`` — the proxy log is on the host filesystem; ``awk`` is run
+                  directly over SSH.  ``container`` is ignored.
+
+    ``log_path`` overrides ``server.proxy_log_path`` when given.
+    """
+    resolved_path = log_path or server.proxy_log_path
+    if server.proxy_log_in_container:
+        remote_cmd = (
+            f"sudo -n docker exec {shlex.quote(container)} "
+            f"awk -v pat={shlex.quote(pattern)} "
+            f"-v start={shlex.quote(start)} "
+            f"-v end={shlex.quote(end)} "
+            f"{shlex.quote(_AWK_EXTRACTOR)} {shlex.quote(resolved_path)}"
+        )
+    else:
+        remote_cmd = (
+            f"sudo -n awk -v pat={shlex.quote(pattern)} "
+            f"-v start={shlex.quote(start)} "
+            f"-v end={shlex.quote(end)} "
+            f"{shlex.quote(_AWK_EXTRACTOR)} {shlex.quote(resolved_path)}"
+        )
     result = subprocess.run(
         ["ssh", server.ssh_alias, remote_cmd],
         capture_output=True,
@@ -165,18 +185,23 @@ def save_to_logs_dir(
 
 def extract_and_save(
     server: Server,
-    container: str,
+    container: str = "",
     *,
     descriptor: str,
     pattern: str = "",
     start: str = "",
     end: str = "",
     save: bool = False,
-    log_path: str = PROXY_LOG_PATH,
+    log_path: str | None = None,
     logs_dir: Path = Path("logs"),
     timeout: float = 360.0,
 ) -> ExtractResult:
-    """Extract matching logs, optionally persist to `logs/`, return a summary."""
+    """Extract matching logs, optionally persist to ``logs/``, return a summary.
+
+    ``container`` is only used when ``server.proxy_log_in_container`` is True;
+    pass an empty string (or omit) for servers whose log is on the host.
+    ``log_path`` overrides ``server.proxy_log_path`` when given.
+    """
     content = extract(
         server, container, pattern=pattern, start=start, end=end,
         log_path=log_path, timeout=timeout,
@@ -198,32 +223,35 @@ def extract_and_save(
     )
 
 
-def extract_host_log(
+def extract_event_logs(
     server: Server,
     *,
-    log_path: str = HOST_EVENT_LOG_PATH,
+    log_path: str | None = None,
     pattern: str = "",
     timeout: float = 120.0,
 ) -> str:
     """Fetch matching lines from a log file on the remote host (no Docker).
 
-    Used for host-level logs such as ``/var/log/flexisip/event-logs`` which
-    Flexisip writes directly to the host filesystem — not inside any container.
-    Logs are always fetched live from the server.
+    Used for host-level logs such as the registration event-logs directory
+    which Flexisip writes directly to the host filesystem — not inside any
+    container.  Logs are always fetched live from the server.
 
-    ``log_path`` may be a file or a directory; ``grep -rE`` handles both.
+    ``log_path`` may be a file or a directory; when omitted it falls back to
+    ``server.event_log_path`` (configured per-server in servers.py).
+    ``grep -rE`` handles both file and directory targets.
     ``pattern`` is an ERE pattern passed to grep (empty → return all lines).
     """
+    resolved_path = log_path or server.event_log_path
     if pattern:
         # -h suppresses the filename prefix that grep adds when scanning a directory,
         # so each output line starts directly with the log timestamp.
         remote_cmd = (
-            f"sudo -n grep -rhE {shlex.quote(pattern)} {shlex.quote(log_path)}"
+            f"sudo -n grep -rhE {shlex.quote(pattern)} {shlex.quote(resolved_path)}"
             f" 2>/dev/null || true"
         )
     else:
         remote_cmd = (
-            f"sudo -n find {shlex.quote(log_path)} -type f | sort"
+            f"sudo -n find {shlex.quote(resolved_path)} -type f | sort"
             f" | xargs sudo -n cat 2>/dev/null"
         )
 

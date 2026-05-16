@@ -26,6 +26,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 class Registration:
     redis_key: str      # full Redis key, e.g. fs:abc123@domain.com
     user: str           # SIP username only,  e.g. abc123
+    domain: str         # full domain, e.g. testing.voip.pinkreseller.com
     domain_short: str   # first two domain labels, e.g. bdaprthirteen.bdapr
     instance_id: str    # UUID of the device/instance
     platform: str       # "Android", "iOS", or "Unknown"
@@ -117,6 +118,7 @@ def parse_registration(
     return Registration(
         redis_key=redis_key,
         user=user,
+        domain=domain,
         domain_short=domain_short,
         instance_id=instance_id,
         platform=platform,

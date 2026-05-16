@@ -934,7 +934,7 @@ def generate_markdown_report(
 def analyze_call_records(
     csv_path: Path,
     server: Server,
-    container: str,
+    container: str = "",
     *,
     output_pdf: Optional[Path] = None,
     save_logs: bool = False,
@@ -950,7 +950,9 @@ def analyze_call_records(
     Args:
         csv_path:         Path to the call records CSV file.
         server:           Flexisip :class:`Server` to fetch logs from.
-        container:        Docker container name running the proxy.
+        container:        Container name for log access.  Pass an empty string
+                          (or omit) when ``server.proxy_log_in_container`` is
+                          False (log fetched directly from host filesystem).
         output_pdf:       PDF destination. Defaults to
                           ``reports/call_records_analysis_<utc-stamp>.pdf``.
         save_logs:        Persist each raw log batch to ``logs/``.

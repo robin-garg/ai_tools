@@ -20,9 +20,8 @@ import click
 from ai_tools.flexisip.docker_utils import find_proxy_container, list_containers
 from ai_tools.flexisip.expiration_notifier import parse_notifier_log
 from ai_tools.flexisip.log_extractor import (
-    HOST_EVENT_LOG_PATH,
     extract_and_save,
-    extract_host_log,
+    extract_event_logs,
     save_to_logs_dir,
 )
 from ai_tools.flexisip.registrar import (
@@ -163,7 +162,7 @@ def _print_report(server_name: str, regs: list, filters: dict | None = None) -> 
 
     # Column widths
     W_USER   = max(len(r.user)          for r in regs)
-    W_DOM    = max(len(r.domain_short)  for r in regs)
+    W_DOM    = max(len(r.domain)        for r in regs)
     W_PLAT   = max(len(r.platform)      for r in regs)
     W_IP     = max(len(r.ip_port)       for r in regs)
     W_SINCE  = 14  # "X hr Y mins ago"
@@ -178,7 +177,7 @@ def _print_report(server_name: str, regs: list, filters: dict | None = None) -> 
 
     for r in sorted(regs, key=lambda x: x.updated_utc, reverse=True):
         click.echo(
-            f"{r.user:<{W_USER}}  {r.domain_short:<{W_DOM}}  {r.platform:<{W_PLAT}}"
+            f"{r.user:<{W_USER}}  {r.domain:<{W_DOM}}  {r.platform:<{W_PLAT}}"
             f"  {r.ip_port:<{W_IP}}"
             f"  {r.updated_utc.strftime('%Y-%m-%d %H:%M:%S')}"
             f"  {r.updated_ist.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -228,7 +227,7 @@ def registrations(server: str, platform: str | None, domain: str | None, pattern
     if platform:
         regs = [r for r in regs if r.platform.lower() == platform.lower()]
     if domain:
-        regs = [r for r in regs if domain.lower() in r.domain_short.lower()]
+        regs = [r for r in regs if domain.lower() in r.domain.lower()]
 
     _print_report(srv.name, regs, filters={"platform": platform, "domain": domain})
 
@@ -329,9 +328,13 @@ def logs(
         sys.exit(2)
 
     srv = get_server(server)
-    click.echo(f"resolving proxy container on {srv.name}...", err=True)
-    container = find_proxy_container(srv)
-    click.echo(f"using container: {container.name}", err=True)
+    if srv.proxy_log_in_container:
+        click.echo(f"resolving proxy container on {srv.name}...", err=True)
+        container_name = find_proxy_container(srv).name
+        click.echo(f"using container: {container_name}", err=True)
+    else:
+        container_name = ""
+        click.echo(f"proxy log is on host filesystem ({srv.proxy_log_path})", err=True)
 
     if call_id:
         pattern = call_id
@@ -350,7 +353,7 @@ def logs(
     click.echo("extracting logs...", err=True)
     result = extract_and_save(
         srv,
-        container.name,
+        container_name,
         descriptor=descriptor,
         pattern=pattern,
         start=start or "",
@@ -429,14 +432,18 @@ def expiration_notifier(
     provider accepted the request (HTTP 200), and any error details.
     """
     srv = get_server(server)
-    click.echo(f"resolving proxy container on {srv.name}...", err=True)
-    container = find_proxy_container(srv)
-    click.echo(f"using container: {container.name}", err=True)
+    if srv.proxy_log_in_container:
+        click.echo(f"resolving proxy container on {srv.name}...", err=True)
+        container_name = find_proxy_container(srv).name
+        click.echo(f"using container: {container_name}", err=True)
+    else:
+        container_name = ""
+        click.echo(f"proxy log is on host filesystem ({srv.proxy_log_path})", err=True)
     click.echo("extracting ContactExpirationNotifier logs...", err=True)
 
     result = extract_and_save(
         srv,
-        container.name,
+        container_name,
         descriptor="expiration-notifier",
         pattern="ContactExpirationNotifier",
         start=start or "",
@@ -606,14 +613,18 @@ def agent_flood(
     from ai_tools.flexisip.iptables import block_ip as apply_block
 
     srv = get_server(server)
-    click.echo(f"resolving proxy container on {srv.name}...", err=True)
-    container = find_proxy_container(srv)
-    click.echo(f"using container: {container.name}", err=True)
+    if srv.proxy_log_in_container:
+        click.echo(f"resolving proxy container on {srv.name}...", err=True)
+        container_name = find_proxy_container(srv).name
+        click.echo(f"using container: {container_name}", err=True)
+    else:
+        container_name = ""
+        click.echo(f"proxy log is on host filesystem ({srv.proxy_log_path})", err=True)
     click.echo(f"extracting logs matching User-Agent '{agent}'...", err=True)
 
     result = extract_and_save(
         srv,
-        container.name,
+        container_name,
         descriptor=f"agent-flood-{agent.lower()}",
         pattern=f"User-Agent.*{agent}",
         start=start or "",
@@ -774,11 +785,13 @@ def call_records(
 
     if container:
         container_name = container
-    else:
+    elif srv.proxy_log_in_container:
         click.echo(f"resolving proxy container on {srv.name}...", err=True)
-        cnt = find_proxy_container(srv)
-        container_name = cnt.name
+        container_name = find_proxy_container(srv).name
         click.echo(f"using container: {container_name}", err=True)
+    else:
+        container_name = ""
+        click.echo(f"proxy log is on host filesystem ({srv.proxy_log_path})", err=True)
 
     click.echo(f"parsing {csv_path.name}...", err=True)
 
@@ -866,9 +879,11 @@ def _fmt_gap(secs: float) -> str:
 )
 @click.option(
     "--log-path",
-    default=HOST_EVENT_LOG_PATH,
-    show_default=True,
-    help="Path to event-log file or directory on the remote host.",
+    default=None,
+    help=(
+        "Path to event-log file or directory on the remote host. "
+        "Defaults to the server's configured event_log_path (see servers.py)."
+    ),
 )
 @click.option(
     "--save/--no-save",
@@ -881,7 +896,7 @@ def event_logs(
     hours: int,
     start: str | None,
     end: str | None,
-    log_path: str,
+    log_path: str | None,
     save: bool,
 ) -> None:
     """Fetch and analyse Flexisip event-logs for a user from the host.
@@ -911,7 +926,7 @@ def event_logs(
         err=True,
     )
 
-    raw = extract_host_log(srv, log_path=log_path, pattern=username)
+    raw = extract_event_logs(srv, log_path=log_path, pattern=username)
 
     # Parse lines and apply time window filter
     events: list[tuple[datetime, str, str]] = []  # (ts, verb, raw_line)

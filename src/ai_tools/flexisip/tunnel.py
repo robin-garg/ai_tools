@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 
 DEFAULT_LOCAL_PORT = 6380
-READY_TIMEOUT_SECONDS = 10.0
+READY_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass

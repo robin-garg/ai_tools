@@ -33,16 +33,18 @@ divider() { echo -e "${BLUE}─────────────────�
 
 prompt() {
     # prompt <variable_name> <question> [default]
-    local -n _ref=$1
+    local _var="$1"
     local question="$2"
     local default="${3:-}"
+    local _input
     if [[ -n "$default" ]]; then
-        read -rp "  ${question} [${default}]: " _ref
-        _ref="${_ref:-$default}"
+        read -rp "  ${question} [${default}]: " _input
+        _input="${_input:-$default}"
     else
-        read -rp "  ${question}: " _ref
-        [[ -n "$_ref" ]] || abort "This field is required."
+        read -rp "  ${question}: " _input
+        [[ -n "$_input" ]] || abort "This field is required."
     fi
+    eval "${_var}=\$_input"
 }
 
 # ── Welcome screen ────────────────────────────────────────────────────────────

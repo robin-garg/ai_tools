@@ -75,6 +75,54 @@ one-off scripts. This keeps them reusable from:
 
 ---
 
+## Flexisip Servers
+
+| Key | Domain / SSH alias | Environment | Policy |
+| --- | --- | --- | --- |
+| `stg2` | `stg2` | Staging | Full read/write — safe to experiment |
+| `stg2b` | `stg2b` | Staging | Full read/write — safe to experiment |
+| `prod` | `flexisip.e1a.aws.wlcomm.net` | **Production** | **READ-ONLY** — see policy below |
+
+### ⚠️ Production server policy (`prod`)
+
+The `prod` server is **production**. Strict read-only access only.
+
+#### ✅ Allowed (read-only)
+
+| Method | Allowed commands / operations |
+| --- | --- |
+| **Redis** (`redis-cli`) | `GET`, `HGETALL`, `KEYS`, `SCAN`, `TTL`, `TYPE` — no writes |
+| **Flexisip socket** (`/tmp/flexisip-proxy-3`) | `REGISTRAR_GET`, `CONFIG_GET`, `CONFIG_LIST` — read-only queries only |
+| **Event logs** | `cat`, `tail`, `ls` on `/var/opt/belledonne-communications/log/flexisip/users/...` via `podman exec` |
+| **Proxy log** | `tail`, `cat`, `grep` on `/usr/local/var/log/flexisip/flexisip-proxy.log` via `podman exec` |
+| **Config file** | `cat`, `grep` on `/etc/flexisip/DEVOPS-32/flexisip.conf` |
+
+#### ❌ Never allowed on production
+
+- Any `CONFIG_SET`, `REGISTRAR_CLEAR`, `REGISTRAR_DELETE`, or other mutating Flexisip socket commands
+- Any `redis-cli SET`, `DEL`, `HSET`, `HDEL`, `EXPIRE`, or any write to Redis
+- Restarting, stopping, or reconfiguring any container or service
+- Running Python scripts (or any script) inside the container unless it is provably read-only
+- Any `podman exec` command that writes files, changes state, or modifies configuration
+
+#### 🔴 Abort rule
+
+If a task **cannot** be completed without making a change on `prod`:
+1. **Stop immediately** — do not proceed
+2. **Inform the user** what would need to change and why
+3. **Wait for explicit approval** before doing anything
+
+#### Visibility note
+
+Scripts run inside the container via `podman exec` are **visible** to anyone
+monitoring the server (e.g. `ps aux` inside the container). Even read-only
+scripts can alarm operators. Prefer simple one-liner commands over multi-line
+Python scripts when possible on production.
+
+SSH access: username `rgarg`, key `~/.ssh/id_ed25519`.
+
+---
+
 ## Flexisip Log Conventions
 
 ### Always fetch logs live from the server
@@ -97,7 +145,7 @@ produce any log output worth analysing. Never treat it as a log source.
 | Log type | Location | How to fetch |
 | --- | --- | --- |
 | SIP call / registration proxy logs | Inside `flexisip-proxy` container: `/usr/local/var/log/flexisip/flexisip-proxy.log` | `docker exec` via `log_extractor.extract()` |
-| Registration event-logs | On the **host**: `/var/log/flexisip/event-logs` | Direct SSH via `log_extractor.extract_host_log()` |
+| Registration event-logs | On the **host**: `/var/log/flexisip/event-logs` | Direct SSH via `log_extractor.extract_event_logs()` |
 
 ---
 

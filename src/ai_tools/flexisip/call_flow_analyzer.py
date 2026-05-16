@@ -67,6 +67,10 @@ _REGISTER_CSEQ_RE= re.compile(r"^CSeq:\s+(\d+)\s+REGISTER", re.MULTILINE)
 _NEW_CONTACT_RE  = re.compile(r"RegistrarDB.*[Bb]inding|New contact.*registered")
 _SEND_INVITE_RE  = re.compile(r"Sending Request SIP message to (sip:\S+)")
 _FORK_REMOVED_RE = re.compile(r"Remove fork ")
+# Additional events not carried on Call-ID blocks
+_CANCEL_FWD_RE   = re.compile(r"nta: sent CANCEL \(\d+\) to (\S+)")
+_ACK_RECV_RE     = re.compile(r"nta: received ACK")
+_PNR_CANCEL_RE   = re.compile(r"PNR 0x[0-9a-f]+: canceling push request")
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -194,9 +198,20 @@ def analyze_log(
         # ── Collect blocks by different matching strategies ───────────────
         # call_blocks: blocks containing Call-ID (push payloads, SIP messages)
         call_blocks = [(t, b) for t, b in blocks if call_id in b]
-        # cseq_blocks: blocks containing CSeq ref (nta events, e.g. "for INVITE (114487215)")
-        cseq_blocks = [(t, b) for t, b in blocks if f"for INVITE ({cseq})" in b or
-                       f"INVITE ({cseq})" in b]
+        # cseq_blocks: blocks containing CSeq ref (nta events).  Expanded to
+        # also catch CANCEL/ACK events that reference the CSeq but not "INVITE".
+        cseq_blocks = [(t, b) for t, b in blocks if
+                       f"for INVITE ({cseq})" in b or
+                       f"INVITE ({cseq})" in b or
+                       f"CANCEL ({cseq})" in b or
+                       f"(CSeq {cseq})" in b]
+        # callee_blocks: blocks that mention the callee AOR within the call
+        # window — captures Redis GOT / ForkCallContext / PNR lines that
+        # Flexisip emits without the Call-ID.
+        callee_blocks = [
+            (t, b) for t, b in blocks
+            if callee in b and t[:19] >= ts[:19] and _in_window(t, ts[:19], end)
+        ]
 
         # ── Walk blocks and build event timeline ──────────────────────────
         events: list[CallEvent] = []
@@ -217,6 +232,10 @@ def analyze_log(
         seen_cancel = False
         seen_bye = False
         seen_487 = False
+        seen_cancel_fwd = False
+        seen_ack = False
+        seen_pnr_cancel = False
+        seen_redis_ts: set[str] = set()
 
         for bt, bb in call_blocks:
             dts = _display_ts(bt)
@@ -233,7 +252,8 @@ def analyze_log(
 
             # Redis contact lookup hit
             gm = _CONTACT_GOT_RE.search(bb)
-            if gm and callee in gm.group(1):
+            if gm and callee in gm.group(1) and bt not in seen_redis_ts:
+                seen_redis_ts.add(bt)
                 ip_port = f"{gm.group(3)}:{gm.group(4)}"
                 conn = _CONN_ID_RE.search(gm.group(2))
                 conn_str = f"conn={conn.group(1)}" if conn else ""
@@ -291,34 +311,57 @@ def analyze_log(
             if _FORK_REMOVED_RE.search(bb) and callee in bb:
                 events.append(CallEvent(dts, "INTERNAL", "Fork removed", "Transaction complete"))
 
-        # ── NTA signal events (matched by CSeq, not Call-ID) ─────────────
+            # Push notification cancelled (call torn down before push completed)
+            if not seen_pnr_cancel and _PNR_CANCEL_RE.search(bb):
+                seen_pnr_cancel = True
+                events.append(CallEvent(dts, "INTERNAL", "Push notification cancelled",
+                    "PNR cancelled — call terminated before push completed"))
+
+        # ── NTA signal events + CANCEL/ACK (matched by CSeq) ─────────────
         for bt, bb in cseq_blocks:
             dts = _display_ts(bt)
+
+            # NTA numeric response codes
             ntam = _NTA_RE.search(bb)
-            if not ntam:
-                continue
-            direction, code = ntam.group(1), ntam.group(2)
-            direction_label = "RECV" if direction == "received" else "SEND"
-            if code == "110" and not seen_110:
-                seen_110 = True
-                events.append(CallEvent(dts, "SEND", "110 Push Sent",
-                    "Caller notified that FCM push was dispatched"))
-            elif code == "180" and not seen_180:
-                seen_180 = True
-                reached_device = True
-                response_ts_disp = dts
-                events.append(CallEvent(dts, direction_label, "180 Ringing", "Device is ringing!"))
-            elif code == "200" and not seen_200:
-                seen_200 = True
-                reached_device = True
-                response_ts_disp = response_ts_disp or dts
-                events.append(CallEvent(dts, direction_label, "200 OK", "Call answered"))
-            elif code == "487" and not seen_487:
-                seen_487 = True
-                events.append(CallEvent(dts, direction_label, "487 Request Terminated", ""))
-            elif code in ("503", "408"):
-                events.append(CallEvent(dts, direction_label, f"{code} (connection error)",
-                    "Old TCP connection dead — attempt on stale contact"))
+            if ntam:
+                direction, code = ntam.group(1), ntam.group(2)
+                direction_label = "RECV" if direction == "received" else "SEND"
+                if code == "100" and not seen_100:
+                    seen_100 = True
+                    events.append(CallEvent(dts, "SEND", "100 Trying",
+                        "Flexisip acknowledged the INVITE"))
+                elif code == "110" and not seen_110:
+                    seen_110 = True
+                    events.append(CallEvent(dts, "SEND", "110 Push Sent",
+                        "Caller notified that FCM push was dispatched"))
+                elif code == "180" and not seen_180:
+                    seen_180 = True
+                    reached_device = True
+                    response_ts_disp = dts
+                    events.append(CallEvent(dts, direction_label, "180 Ringing", "Device is ringing!"))
+                elif code == "200" and not seen_200:
+                    seen_200 = True
+                    reached_device = True
+                    response_ts_disp = response_ts_disp or dts
+                    events.append(CallEvent(dts, direction_label, "200 OK", "Call answered"))
+                elif code == "487" and not seen_487:
+                    seen_487 = True
+                    events.append(CallEvent(dts, direction_label, "487 Request Terminated", ""))
+                elif code in ("503", "408"):
+                    events.append(CallEvent(dts, direction_label, f"{code} (connection error)",
+                        "Old TCP connection dead — attempt on stale contact"))
+
+            # CANCEL forwarded downstream to device
+            cfm = _CANCEL_FWD_RE.search(bb)
+            if cfm and not seen_cancel_fwd:
+                seen_cancel_fwd = True
+                events.append(CallEvent(dts, "SEND", "CANCEL forwarded to device",
+                    cfm.group(1)))
+
+            # ACK received (after 487 / 200)
+            if _ACK_RECV_RE.search(bb) and not seen_ack:
+                seen_ack = True
+                events.append(CallEvent(dts, "RECV", "ACK received", ""))
 
         # ── REGISTER events (device wake-up): time-window scan ───────────
         # Only include REGISTERs that arrive AFTER the INVITE and within 60s
@@ -343,6 +386,38 @@ def analyze_log(
                 dts = _display_ts(bt)
                 events.append(CallEvent(dts, "RECV", "REGISTER (device woke up)",
                     f"{rcseq_str} — device re-registering on new TCP connection"))
+
+        # ── Callee-keyed blocks: Redis GOT / ForkCallContext / PNR ──────
+        # Flexisip logs these without the Call-ID so they are invisible to the
+        # call_blocks scan.  Scan all callee_blocks and pick them up here,
+        # deduplicating via the same seen_* flags used above.
+        for bt, bb in callee_blocks:
+            dts = _display_ts(bt)
+
+            # Redis contact lookup result
+            gm = _CONTACT_GOT_RE.search(bb)
+            if gm and callee in gm.group(1) and bt not in seen_redis_ts:
+                seen_redis_ts.add(bt)
+                ip_port = f"{gm.group(3)}:{gm.group(4)}"
+                conn = _CONN_ID_RE.search(gm.group(2))
+                conn_str = f"conn={conn.group(1)}" if conn else ""
+                pn = _PN_PROVIDER_RE.search(gm.group(2))
+                pn_str = f"pn-provider={pn.group(1)}" if pn else ""
+                events.append(CallEvent(dts, "INTERNAL", "Redis contact found",
+                    f"{ip_port} {conn_str} {pn_str}".strip()))
+
+            # ForkCallContext created
+            if not seen_fork:
+                fkm = _FORK_CTX_RE.search(bb)
+                if fkm:
+                    seen_fork = True
+                    events.append(CallEvent(dts, "INTERNAL", "Fork created", fkm.group(1)))
+
+            # PNR cancellation (not in call_blocks — block contains no Call-ID)
+            if not seen_pnr_cancel and _PNR_CANCEL_RE.search(bb):
+                seen_pnr_cancel = True
+                events.append(CallEvent(dts, "INTERNAL", "Push notification cancelled",
+                    "PNR cancelled — call terminated before push completed"))
 
         # Sort all events by timestamp
         events.sort(key=lambda e: e.timestamp)

@@ -34,7 +34,26 @@ from pathlib import Path
 from typing import Optional
 
 from ai_tools.flexisip.log_extractor import extract_and_save
+from ai_tools.flexisip.log_utils import display_ts, ms_delta, split_blocks, ts_to_dt
 from ai_tools.flexisip.servers import Server
+from ai_tools.flexisip.sip_patterns import (
+    _BYE_RE,
+    _CALL_ID_RE,
+    _CANCEL_RE,
+    _CONTACT_GOT_RE,
+    _CSEQ_RE,
+    _FCM_STATUS_RE,
+    _FIREBASE_RE,
+    _FORK_CTX_RE,
+    _FORK_NEW_REG_RE,
+    _INVITE_FROM_RE,
+    _NTA_RE,
+    _PN_PROVIDER_RE,
+    _PUSH_TTL_RE,
+    _REGISTER_CSEQ_RE,
+    _REGISTER_RE,
+    _110_RE,
+)
 from ai_tools.pdf.writer import markdown_to_pdf
 
 EDT = timezone(timedelta(hours=-4))
@@ -224,129 +243,28 @@ def group_into_batches(
     return batches
 
 
-# ── Log analysis — compiled patterns ─────────────────────────────────────────
+# ── Log analysis — compiled patterns (local to this module) ──────────────────
 
-_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-_TS_MS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3})")
-
-# INVITE detection
-_INVITE_FROM_RE = re.compile(r"Receiving new Request SIP message INVITE from sip:([^@]+)@")
-_CALL_ID_RE = re.compile(r"^Call-ID:\s+(\S+)", re.MULTILINE)
-_CSEQ_RE = re.compile(r"^CSeq:\s+(\d+\s+INVITE)", re.MULTILINE)
 _FROM_DISPLAY_RE = re.compile(r'^From:\s+"([^"]+)"', re.MULTILINE)
 _USER_AGENT_RE = re.compile(r"^User-Agent:\s+(.+)", re.MULTILINE)
 _CALLER_CONTACT_RE = re.compile(r"^Contact:\s+<sip:[^@]+@([0-9.]+):(\d+)", re.MULTILINE)
-
-# Redis contact lookup
 _FETCHING_RE = re.compile(r"Fetching fs:([^\s\[]+)")
 _REDIS_LATENCY_RE = re.compile(r"Redis command completed in (\d+)ms")
-_CONTACT_GOT_RE = re.compile(r'GOT fs:(\S+?) .+?-->\s*"(<sip:[^@]+@([0-9.]+):(\d+)[^"]*)"')
-_PN_PROVIDER_RE = re.compile(r"pn-provider=([^;>?&\s\"]+)")
 _PN_SILENT_RE = re.compile(r"pn-silent=([^;>?&\s\"]+)")
 _PN_TIMEOUT_RE = re.compile(r"pn-timeout=([^;>?&\s\"]+)")
-
-# ForkCallContext
-_FORK_CTX_RE = re.compile(r"New ForkCallContext (0x[0-9a-f]+)")
 _FORK_RE = re.compile(r"Fork to (sip:[^\s]+)")
-
-# FirebaseV1 call push: "ttl": "90s"  (ContactExpirationNotifier uses "0s")
-_FIREBASE_RE = re.compile(r"FirebaseV1 request")
-_PUSH_TTL_RE = re.compile(r'"ttl":\s*"(\d+)s"')
 _PUSH_PRIORITY_RE = re.compile(r'"priority":\s*"([^"]+)"')
 _PUSH_TOKEN_RE = re.compile(r'"token":\s*"([^"]+)"')
 _PUSH_FROM_URI_RE = re.compile(r'"from-uri":\s*"([^"]+)"')
 _PUSH_DISPLAY_NAME_RE = re.compile(r'"display-name":\s*"([^"]+)"')
 _PUSH_CALL_ID_IN_PAYLOAD_RE = re.compile(r'"call-id":\s*"([^"]+)"')
 _FCM_PROJECT_RE = re.compile(r"/v1/projects/([^/]+)/messages")
-
-# FCM HTTP/2 response
-_FCM_STATUS_RE = re.compile(r":status = (\d+)")
 _FCM_MSG_NAME_RE = re.compile(r'"name":\s*"(projects/[^"]+)"')
 _PNR_STATE_RE = re.compile(r"switching state from (\w+) -> (\w+)")
-
-# SIP signalling
-_110_RE = re.compile(r"110 Push sent")
-_NTA_RE = re.compile(r"nta: (sent|received) (\d{3}) ([^\s(]+)")
 _ACK_RE = re.compile(r"Receiving new Request SIP message ACK")
-_BYE_RE = re.compile(r"Receiving new Request SIP message BYE")
-_CANCEL_RE = re.compile(r"Receiving new Request SIP message CANCEL")
 _CANCEL_REASON_RE = re.compile(r"Reason:\s+Q\.850\s*;cause=\d+\s*;text=\"([^\"]+)\"", re.MULTILINE)
-_FORK_NEW_REG_RE = re.compile(r"ForkCallContext::onNewRegister")
-
-# Device wake-up REGISTER
-_REGISTER_RE = re.compile(r"Receiving new Request SIP message REGISTER from sip:([^@]+)@")
-_REGISTER_CSEQ_RE = re.compile(r"^CSeq:\s+(\d+\s+REGISTER)", re.MULTILINE)
-
-# INVITE forwarded to device
 _SENDING_INVITE_RE = re.compile(r"Sending Request SIP message to (sip:[0-9a-zA-Z]+@[0-9.]+:\d+)")
-
-# Connection refused (device offline when INVITE was sent)
 _CONN_REFUSED_RE = re.compile(r"nta: INVITE .+: Connection refused \(\d+\) with udp/\[([0-9.]+)\]:(\d+)")
-
-
-# ── Log analysis — helpers ────────────────────────────────────────────────────
-
-def _split_blocks(text: str) -> list[tuple[str, str]]:
-    """Split raw log text into (timestamp_with_ms, full_block_text) pairs.
-
-    A block begins on a line that starts with ``YYYY-MM-DD`` and includes all
-    following continuation lines (SIP headers, JSON payloads, etc.) until the
-    next timestamp line.  We preserve milliseconds in the stored timestamp so
-    the report can show sub-second precision.
-    """
-    blocks: list[tuple[str, str]] = []
-    cur_ts = ""
-    cur_lines: list[str] = []
-    for line in text.splitlines():
-        m = _TS_MS_RE.match(line) or _TS_RE.match(line)
-        if m:
-            if cur_ts:
-                blocks.append((cur_ts, "\n".join(cur_lines)))
-            cur_ts = m.group(1)
-            cur_lines = [line]
-        else:
-            cur_lines.append(line)
-    if cur_ts:
-        blocks.append((cur_ts, "\n".join(cur_lines)))
-    return blocks
-
-
-def _ts_to_dt(ts: Optional[str]) -> Optional[datetime]:
-    """Parse ``YYYY-MM-DD HH:MM:SS[.mmm]`` log timestamp to UTC-aware datetime."""
-    if not ts:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S:%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(ts, fmt).replace(tzinfo=UTC)
-        except ValueError:
-            continue
-    return None
-
-
-def _ts_seconds(ts: Optional[str]) -> str:
-    """Return ``HH:MM:SS.mmm`` display string from a log timestamp."""
-    if not ts:
-        return "—"
-    parts = ts.split(" ")
-    if len(parts) >= 2:
-        time_part = parts[1]
-        # convert colon-separated millis to dot: "HH:MM:SS:mmm" → "HH:MM:SS.mmm"
-        segments = time_part.split(":")
-        if len(segments) == 4:
-            return f"{segments[0]}:{segments[1]}:{segments[2]}.{segments[3]}"
-        return time_part
-    return ts
-
-
-def _ms_delta(ts_start: Optional[str], ts_end: Optional[str]) -> Optional[int]:
-    """Return integer milliseconds between two log timestamps, or None."""
-    if not ts_start or not ts_end:
-        return None
-    dt1 = _ts_to_dt(ts_start)
-    dt2 = _ts_to_dt(ts_end)
-    if dt1 and dt2:
-        return int((dt2 - dt1).total_seconds() * 1000)
-    return None
 
 
 def _analyze_call(
@@ -368,7 +286,7 @@ def _analyze_call(
     caller_ip: Optional[str] = None
 
     for ts, block in blocks:
-        block_dt = _ts_to_dt(ts)
+        block_dt = ts_to_dt(ts)
         if block_dt is None or abs((block_dt - call_time).total_seconds()) > tol.total_seconds():
             continue
         fm = _INVITE_FROM_RE.search(block)
@@ -381,7 +299,8 @@ def _analyze_call(
             invite_ts = ts
             m = _CSEQ_RE.search(block)
             if m:
-                invite_cseq = m.group(1)
+                # _CSEQ_RE captures only the number; reconstruct display form
+                invite_cseq = f"{m.group(1)} INVITE"
             m = _FROM_DISPLAY_RE.search(block)
             if m:
                 invite_display_name = m.group(1)
@@ -396,7 +315,7 @@ def _analyze_call(
     # Fallback: check FirebaseV1 payload "call-id" near the call time
     if call_id is None:
         for ts, block in blocks:
-            block_dt = _ts_to_dt(ts)
+            block_dt = ts_to_dt(ts)
             if block_dt and abs((block_dt - call_time).total_seconds()) <= tol.total_seconds():
                 pm = _PUSH_CALL_ID_IN_PAYLOAD_RE.search(block)
                 if pm:
@@ -581,7 +500,7 @@ def _analyze_call(
                 nm = _FCM_MSG_NAME_RE.search(block)
                 if nm:
                     fcm_message_name = nm.group(1)
-                delivery_ms = _ms_delta(push_ts, ts) if push_ts else None
+                delivery_ms = ms_delta(push_ts, ts) if push_ts else None
                 delivery_str = f"{delivery_ms}ms round-trip" if delivery_ms is not None else ""
                 fcm_detail_parts = [p for p in [delivery_str, fcm_message_name or ""] if p]
                 timeline.append(SipEvent(
@@ -667,10 +586,10 @@ def _analyze_call(
     wake_latency_ms: Optional[int] = None
 
     if push_ts and record.to_user:
-        push_dt = _ts_to_dt(push_ts)
+        push_dt = ts_to_dt(push_ts)
         wake_window = timedelta(seconds=90)
         for ts, block in blocks:
-            blk_dt = _ts_to_dt(ts)
+            blk_dt = ts_to_dt(ts)
             if not blk_dt or not push_dt:
                 continue
             delta = (blk_dt - push_dt).total_seconds()
@@ -686,7 +605,7 @@ def _analyze_call(
                 cct = _CALLER_CONTACT_RE.search(block)
                 if cct:
                     register_ip_port = f"{cct.group(1)}:{cct.group(2)}"
-                wake_latency_ms = _ms_delta(push_ts, ts)
+                wake_latency_ms = ms_delta(push_ts, ts)
                 reg_detail_parts = [p for p in [
                     f"Wake latency: {wake_latency_ms}ms after push" if wake_latency_ms else "",
                     f"CSeq: {register_cseq}" if register_cseq else "",
@@ -730,7 +649,7 @@ def _analyze_call(
     else:
         outcome = f"Ended — {record.hangup_cause}"
 
-    fcm_delivery_ms = _ms_delta(push_ts, next(
+    fcm_delivery_ms = ms_delta(push_ts, next(
         (ts for ts, blk in call_blocks if _FCM_STATUS_RE.search(blk)), None
     )) if push_ts else None
 
@@ -795,7 +714,7 @@ def analyze_batch(
     tolerance_mins: int = 3,
 ) -> list[CallFlowSummary]:
     """Analyse all calls in *batch* against *log_text* and return per-call summaries."""
-    blocks = _split_blocks(log_text)
+    blocks = split_blocks(log_text)
     return [_analyze_call(rec, blocks, tolerance_mins) for rec in batch.records]
 
 
@@ -803,7 +722,7 @@ def analyze_batch(
 
 def _fmt_ts(ts: Optional[str]) -> str:
     """Return HH:MM:SS.mmm for display, or '—' if None."""
-    return _ts_seconds(ts) if ts else "—"
+    return display_ts(ts)
 
 
 def generate_markdown_report(
@@ -876,9 +795,9 @@ def generate_markdown_report(
 
         # ── Timing summary line ───────────────────────────────────────────────
         timing_parts: list[str] = []
-        invite_to_ring = _ms_delta(s.invite_timestamp, s.ts_180)
-        invite_to_answer = _ms_delta(s.invite_timestamp, s.ts_200)
-        reg_to_ring = _ms_delta(s.register_timestamp, s.ts_180)
+        invite_to_ring = ms_delta(s.invite_timestamp, s.ts_180)
+        invite_to_answer = ms_delta(s.invite_timestamp, s.ts_200)
+        reg_to_ring = ms_delta(s.register_timestamp, s.ts_180)
         if invite_to_answer is not None:
             timing_parts.append(f"INVITE→200 OK: {invite_to_answer/1000:.1f}s")
         if invite_to_ring is not None:
@@ -902,7 +821,7 @@ def generate_markdown_report(
 
         if s.timeline:
             for j, ev in enumerate(s.timeline, 1):
-                ts_disp = _ts_seconds(ev.timestamp) if ev.timestamp else "—"
+                ts_disp = display_ts(ev.timestamp) if ev.timestamp else "—"
                 safe_desc = ev.description.replace("|", "∣")
                 safe_detail = (ev.detail or "").replace("|", "∣")
                 bold = f"**{safe_desc}**" if ev.is_key_event else safe_desc
@@ -939,7 +858,7 @@ def analyze_call_records(
     output_pdf: Optional[Path] = None,
     save_logs: bool = False,
     logs_dir: Path = Path("logs"),
-    reports_dir: Path = Path("reports"),
+    reports_dir: Path = Path("reports") / "calls",
     batch_window_mins: int = BATCH_WINDOW_MINS,
     buffer_mins: int = BUFFER_MINS,
     tolerance_mins: int = 3,
@@ -1035,9 +954,11 @@ def analyze_call_records(
     md = generate_markdown_report(csv_path, server.name, all_summaries, batches)
 
     if output_pdf is None:
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
-        output_pdf = reports_dir / f"call_records_analysis_{stamp}.pdf"
+        now_utc = datetime.now(tz=UTC)
+        date_folder = reports_dir / now_utc.strftime("%Y-%m-%d")
+        date_folder.mkdir(parents=True, exist_ok=True)
+        stamp = now_utc.strftime("%Y%m%d_%H%M%S")
+        output_pdf = date_folder / f"call_records_analysis_{stamp}.pdf"
 
     _log(f"Rendering PDF → {output_pdf}")
     return markdown_to_pdf(

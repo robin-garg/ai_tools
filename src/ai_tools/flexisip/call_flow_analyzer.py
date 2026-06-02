@@ -27,43 +27,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from ai_tools.flexisip.log_utils import display_ts, split_blocks, ts_to_dt
+from ai_tools.flexisip.sip_patterns import (
+    _BYE_RE,
+    _CALL_ID_RE,
+    _CANCEL_RE,
+    _CONTACT_GOT_RE,
+    _CSEQ_RE,
+    _FCM_STATUS_RE,
+    _FIREBASE_RE,
+    _FORK_CTX_RE,
+    _FORK_NEW_REG_RE,
+    _INVITE_FROM_RE,
+    _NTA_RE,
+    _PN_PROVIDER_RE,
+    _PUSH_TTL_RE,
+    _REGISTER_CSEQ_RE,
+    _REGISTER_RE,
+    _TS_MS_RE,
+    _TS_RE,
+    _110_RE,
+)
 from ai_tools.pdf.writer import markdown_to_pdf
 
 UTC = timezone.utc
 
-# ── Compiled regex patterns ───────────────────────────────────────────────────
+# ── Patterns local to this module (not shared) ────────────────────────────────
 
-_TS_MS_RE   = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{3})")
-_TS_RE      = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-
-# INVITE detection
-_INVITE_FROM_RE  = re.compile(r"Receiving new Request SIP message INVITE from sip:([^@]+)@")
 _INVITE_TO_RE    = re.compile(r"nta: received INVITE sip:([^@]+)@")
-_CALL_ID_RE      = re.compile(r"^Call-ID:\s+(\S+)", re.MULTILINE)
-_CSEQ_RE         = re.compile(r"^CSeq:\s+(\d+)\s+INVITE", re.MULTILINE)
-
-# Redis contact lookup
-_CONTACT_GOT_RE  = re.compile(r'GOT fs:(\S+?) .+?-->\s*"(<sip:[^@]+@([0-9.]+):(\d+)[^"]*)"')
-_PN_PROVIDER_RE  = re.compile(r"pn-provider=([^;>?&\s\"]+)")
 _CONN_ID_RE      = re.compile(r"fs-conn-id=([0-9a-f]+)")
-
-# ForkCallContext
-_FORK_CTX_RE     = re.compile(r"New ForkCallContext (0x[0-9a-f]+)")
-_FORK_NEW_REG_RE = re.compile(r"ForkCallContext::onNewRegister")
-
-# Push notification
 _PNR_CREATE_RE   = re.compile(r"Creating a push notif context (PNR 0x[0-9a-f]+)")
-_FIREBASE_RE     = re.compile(r"FirebaseV1 request")
-_PUSH_TTL_RE     = re.compile(r'"ttl":\s*"(\d+)s"')
-_FCM_STATUS_RE   = re.compile(r":status = (\d+)")
-
-# SIP signalling
-_110_RE          = re.compile(r"110 Push sent")
-_NTA_RE          = re.compile(r"nta: (sent|received) (\d{3})")
-_CANCEL_RE       = re.compile(r"Receiving new Request SIP message CANCEL")
-_BYE_RE          = re.compile(r"Receiving new Request SIP message BYE")
-_REGISTER_RE     = re.compile(r"Receiving new Request SIP message REGISTER from sip:([^@]+)@")
-_REGISTER_CSEQ_RE= re.compile(r"^CSeq:\s+(\d+)\s+REGISTER", re.MULTILINE)
 _NEW_CONTACT_RE  = re.compile(r"RegistrarDB.*[Bb]inding|New contact.*registered")
 _SEND_INVITE_RE  = re.compile(r"Sending Request SIP message to (sip:\S+)")
 _FORK_REMOVED_RE = re.compile(r"Remove fork ")
@@ -109,47 +102,6 @@ class CallFlowReport:
     calls: list[CallFlow]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _split_blocks(text: str) -> list[tuple[str, str]]:
-    """Split raw log text into (timestamp_with_ms, full_block_text) pairs."""
-    blocks: list[tuple[str, str]] = []
-    cur_ts = ""
-    cur_lines: list[str] = []
-    for line in text.splitlines():
-        m = _TS_MS_RE.match(line) or _TS_RE.match(line)
-        if m:
-            if cur_ts:
-                blocks.append((cur_ts, "\n".join(cur_lines)))
-            cur_ts = m.group(1)
-            cur_lines = [line]
-        else:
-            cur_lines.append(line)
-    if cur_ts:
-        blocks.append((cur_ts, "\n".join(cur_lines)))
-    return blocks
-
-
-def _ts_to_dt(ts: str) -> Optional[datetime]:
-    for fmt in ("%Y-%m-%d %H:%M:%S:%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(ts, fmt).replace(tzinfo=UTC)
-        except ValueError:
-            continue
-    return None
-
-
-def _display_ts(ts: str) -> str:
-    """Convert 'YYYY-MM-DD HH:MM:SS:mmm' → 'HH:MM:SS.mmm'."""
-    parts = ts.split(" ")
-    if len(parts) < 2:
-        return ts
-    seg = parts[1].split(":")
-    if len(seg) == 4:
-        return f"{seg[0]}:{seg[1]}:{seg[2]}.{seg[3]}"
-    return parts[1]
-
-
 def _in_window(ts: str, start: str, end: str) -> bool:
     """Return True if ts (YYYY-MM-DD HH:MM:SS…) falls within [start, end]."""
     prefix = ts[:19]
@@ -173,7 +125,7 @@ def analyze_log(
     *caller* to *callee* within the optional UTC time window (*start* / *end*
     as ``'YYYY-MM-DD HH:MM:SS'`` strings).
     """
-    blocks = _split_blocks(log_text)
+    blocks = split_blocks(log_text)
     calls: list[CallFlow] = []
 
     # ── Find all INVITE blocks for this caller → callee pair ─────────────────
@@ -238,7 +190,7 @@ def analyze_log(
         seen_redis_ts: set[str] = set()
 
         for bt, bb in call_blocks:
-            dts = _display_ts(bt)
+            dts = display_ts(bt)
 
             # INVITE received (the opening event)
             if _INVITE_FROM_RE.search(bb) and caller in bb and _CALL_ID_RE.search(bb):
@@ -319,7 +271,7 @@ def analyze_log(
 
         # ── NTA signal events + CANCEL/ACK (matched by CSeq) ─────────────
         for bt, bb in cseq_blocks:
-            dts = _display_ts(bt)
+            dts = display_ts(bt)
 
             # NTA numeric response codes
             ntam = _NTA_RE.search(bb)
@@ -367,12 +319,12 @@ def analyze_log(
         # Only include REGISTERs that arrive AFTER the INVITE and within 60s
         # (the typical push wake-up latency).  This avoids attributing REGISTERs
         # triggered by a later call back to earlier calls.
-        invite_dt = _ts_to_dt(ts)
+        invite_dt = ts_to_dt(ts)
         for bt, bb in blocks:
             rm = _REGISTER_RE.search(bb)
             if not rm or callee not in rm.group(1):
                 continue
-            reg_dt = _ts_to_dt(bt)
+            reg_dt = ts_to_dt(bt)
             if invite_dt and reg_dt:
                 delta = (reg_dt - invite_dt).total_seconds()
                 if delta < 0 or delta > 60:   # must be 0-60s after this INVITE
@@ -383,7 +335,7 @@ def analyze_log(
             if key not in seen_register:
                 seen_register.add(key)
                 device_registered = True
-                dts = _display_ts(bt)
+                dts = display_ts(bt)
                 events.append(CallEvent(dts, "RECV", "REGISTER (device woke up)",
                     f"{rcseq_str} — device re-registering on new TCP connection"))
 
@@ -392,7 +344,7 @@ def analyze_log(
         # call_blocks scan.  Scan all callee_blocks and pick them up here,
         # deduplicating via the same seen_* flags used above.
         for bt, bb in callee_blocks:
-            dts = _display_ts(bt)
+            dts = display_ts(bt)
 
             # Redis contact lookup result
             gm = _CONTACT_GOT_RE.search(bb)
@@ -438,7 +390,7 @@ def analyze_log(
             call_index=len(calls) + 1,
             cseq=cseq,
             call_id=call_id,
-            invite_ts=_display_ts(ts),
+            invite_ts=display_ts(ts),
             events=events,
             push_sent=push_sent,
             device_registered=device_registered,
@@ -536,8 +488,9 @@ def analyze_and_render(
     md_content = render_markdown(report)
 
     # Default output paths
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    reports_dir = Path("reports")
+    now_utc = datetime.now(UTC)
+    stamp = now_utc.strftime("%Y%m%d_%H%M%S")
+    reports_dir = Path("reports") / "calls" / now_utc.strftime("%Y-%m-%d")
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     if output_md is None:

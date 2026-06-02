@@ -22,13 +22,12 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
+from ai_tools.flexisip.log_utils import split_blocks_text
+
 
 # --------------------------------------------------------------------------- #
-# Compiled regexes                                                             #
+# Compiled regexes (local to this module)                                      #
 # --------------------------------------------------------------------------- #
-
-# Detects the start of a log block (timestamp line)
-_RE_BLOCK_TS = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 
 # User-Agent header value (first occurrence in the block)
 _RE_UA = re.compile(r"(?m)^User-Agent:\s*(.+)")
@@ -58,22 +57,6 @@ class AgentHit:
 # --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
-
-def _split_blocks(log_text: str) -> list[str]:
-    """Split raw log text into individual log blocks."""
-    blocks: list[str] = []
-    current: list[str] = []
-    for line in log_text.splitlines():
-        if _RE_BLOCK_TS.match(line):
-            if current:
-                blocks.append("\n".join(current))
-            current = [line]
-        else:
-            current.append(line)
-    if current:
-        blocks.append("\n".join(current))
-    return blocks
-
 
 def _source_ip(block: str) -> str | None:
     """Return the true source IP from the first Via header in a SIP block."""
@@ -108,7 +91,7 @@ def parse_agent_traffic(
     ip_agent: dict[str, str] = {}
     filter_lower = agent_filter.lower()
 
-    for block in _split_blocks(log_text):
+    for block in split_blocks_text(log_text):
         ua_m = _RE_UA.search(block)
         if not ua_m:
             continue

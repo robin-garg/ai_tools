@@ -27,13 +27,6 @@ from pathlib import Path
 
 from ai_tools.flexisip.servers import Server
 
-# Module-level path constants are kept for backward compatibility and as the
-# fallback when no Server object is available.  Prefer server.proxy_log_path
-# and server.event_log_path when a Server is in scope — those values come from
-# the per-server config in servers.py and are the single source of truth.
-PROXY_LOG_PATH = "/usr/local/var/log/flexisip/flexisip-proxy.log"
-EVENT_LOG_PATH = "/var/log/flexisip/event-logs"
-
 # awk block-extractor: groups lines starting with a date into a single block
 # ("block" = timestamp line + its continuation lines — SIP bodies, JSON push
 # payloads, etc.). Emits the whole contiguous span of blocks from the first

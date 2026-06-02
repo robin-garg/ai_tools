@@ -24,6 +24,8 @@ from ai_tools.flexisip.log_extractor import (
     extract_event_logs,
     save_to_logs_dir,
 )
+from ai_tools.flexisip.log_utils import fmt_gap
+from ai_tools.flexisip.reg_gap_analysis import analyze_reg_gaps
 from ai_tools.flexisip.registrar import (
     connect,
     count_keys,
@@ -580,6 +582,11 @@ def expiration_notifier(
     default=False,
     help="Also save raw extracted logs to logs/.",
 )
+@click.option(
+    "--list-rules/--no-list-rules",
+    default=False,
+    help="Print current iptables DROP rules on the server after the report.",
+)
 def agent_flood(
     server: str,
     agent: str,
@@ -591,6 +598,7 @@ def agent_flood(
     start: str | None,
     end: str | None,
     save: bool,
+    list_rules: bool,
 ) -> None:
     """Detect and optionally block SIP flood traffic by User-Agent.
 
@@ -608,9 +616,13 @@ def agent_flood(
 
       # Dry-run — see the iptables commands without running them
       ai-tools flexisip agent-flood -s stg2b --block --dry-run
+
+      # Show currently blocked IPs after the report
+      ai-tools flexisip agent-flood -s stg2b --list-rules
     """
     from ai_tools.flexisip.sip_agent_analyzer import parse_agent_traffic
     from ai_tools.flexisip.iptables import block_ip as apply_block
+    from ai_tools.flexisip.iptables import list_rules as get_rules
 
     srv = get_server(server)
     if srv.proxy_log_in_container:
@@ -673,6 +685,15 @@ def agent_flood(
 
     # ── Block ────────────────────────────────────────────────────────────────
     if not block and not dry_run:
+        # Skip block section but still show rules if requested
+        if list_rules:
+            click.echo("")
+            click.echo(f"Current iptables INPUT rules on {srv.name}:")
+            _sep()
+            try:
+                click.echo(get_rules(srv))
+            except RuntimeError as exc:
+                click.echo(f"  ✗ Could not fetch rules: {exc}", err=True)
         return
 
     click.echo("")
@@ -703,6 +724,104 @@ def agent_flood(
             + (f"  |  {failed} failed" if failed else "")
         )
 
+    # ── List current rules ───────────────────────────────────────────────────
+    if list_rules:
+        click.echo("")
+        click.echo(f"Current iptables INPUT rules on {srv.name}:")
+        _sep()
+        try:
+            click.echo(get_rules(srv))
+        except RuntimeError as exc:
+            click.echo(f"  ✗ Could not fetch rules: {exc}", err=True)
+
+
+@flexisip.command("blocked-ips")
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2 or stg2b).",
+)
+@click.option(
+    "--unblock", "-u", "unblock_ip",
+    default=None,
+    metavar="IP",
+    help="Remove the DROP rule for this IP address.",
+)
+@click.option(
+    "--port",
+    default=5060,
+    show_default=True,
+    type=int,
+    help="Destination port used in the original block rule.",
+)
+@click.option(
+    "--proto",
+    default="udp",
+    show_default=True,
+    type=click.Choice(["udp", "tcp"], case_sensitive=False),
+    help="Protocol used in the original block rule.",
+)
+@click.option(
+    "--chain",
+    default="INPUT",
+    show_default=True,
+    help="iptables chain to inspect / modify.",
+)
+@click.option(
+    "--dry-run/--no-dry-run",
+    default=False,
+    help="Print the unblock command without executing it.",
+)
+def blocked_ips(
+    server: str,
+    unblock_ip: str | None,
+    port: int,
+    proto: str,
+    chain: str,
+    dry_run: bool,
+) -> None:
+    """List currently blocked IPs, or unblock a specific IP.
+
+    Without --unblock, prints the current iptables rules for the chain so you
+    can see which IPs have DROP rules applied.  With --unblock, removes the
+    matching DROP rule.
+
+    \b
+    Examples:
+      # List all blocked IPs on the server
+      ai-tools flexisip blocked-ips -s stg2b
+
+      # Unblock a specific IP
+      ai-tools flexisip blocked-ips -s stg2b --unblock 1.2.3.4
+
+      # Dry-run — see what would be removed
+      ai-tools flexisip blocked-ips -s stg2b --unblock 1.2.3.4 --dry-run
+    """
+    from ai_tools.flexisip.iptables import list_rules as get_rules
+    from ai_tools.flexisip.iptables import unblock_ip as remove_block
+
+    srv = get_server(server)
+
+    if unblock_ip:
+        # ── Unblock mode ─────────────────────────────────────────────────────
+        label = "[dry-run]" if dry_run else "Removing"
+        click.echo(f"{label} DROP rule for {unblock_ip} on {srv.name}...")
+        try:
+            cmd = remove_block(srv, unblock_ip, port=port, proto=proto, chain=chain, dry_run=dry_run)
+            click.echo(f"  {'[dry-run]' if dry_run else '✓ unblocked'}  {unblock_ip}  →  {cmd}")
+        except RuntimeError as exc:
+            click.echo(f"  ✗ FAILED: {exc}", err=True)
+        return
+
+    # ── List mode (default) ───────────────────────────────────────────────────
+    click.echo(f"Current iptables {chain} rules on {srv.name}:")
+    _sep()
+    try:
+        click.echo(get_rules(srv, chain=chain))
+    except RuntimeError as exc:
+        click.echo(f"  ✗ Could not fetch rules: {exc}", err=True)
+
 
 @flexisip.command("call-records")
 @click.option(
@@ -726,7 +845,7 @@ def agent_flood(
     "--output", "-o", "output_pdf",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Output PDF path.  Defaults to reports/call_records_analysis_<utc-stamp>.pdf.",
+    help="Output PDF path.  Defaults to reports/calls/call_records_analysis_<utc-stamp>.pdf.",
 )
 @click.option(
     "--save/--no-save",
@@ -834,18 +953,6 @@ def _parse_event_ts(line: str) -> datetime | None:
         ).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
-
-
-def _fmt_gap(secs: float) -> str:
-    s = int(secs)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        m, sec = divmod(s, 60)
-        return f"{m}m {sec:02d}s"
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h}h {m:02d}m {sec:02d}s"
 
 
 @flexisip.command("event-logs")
@@ -1054,14 +1161,14 @@ def event_logs(
     "output_pdf",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Destination PDF path (default: reports/call_flow_<caller>_to_<callee>_<ts>.pdf).",
+    help="Destination PDF path (default: reports/calls/call_flow_<caller>_to_<callee>_<ts>.pdf).",
 )
 @click.option(
     "--output-md",
     "output_md",
     default=None,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Destination Markdown path (default: reports/call_flow_<caller>_to_<callee>_<ts>.md).",
+    help="Destination Markdown path (default: reports/calls/call_flow_<caller>_to_<callee>_<ts>.md).",
 )
 def call_flow(
     log_file: Path,
@@ -1215,6 +1322,57 @@ def pcap_cmd(
         click.echo(f"Saved to  : {saved}")
     else:
         click.echo("(--no-save: output not written to disk)")
+
+
+@flexisip.command("reg-gap")
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Flexisip server to fetch event logs from.",
+)
+@click.option(
+    "--username", "-u",
+    required=True,
+    help="Username or AOR fragment to filter (e.g. 762cbe93429d).",
+)
+@click.option(
+    "--hours",
+    default=24,
+    show_default=True,
+    type=int,
+    help="Look-back window in hours. Use 0 for all available history.",
+)
+def reg_gap(server: str, username: str, hours: int) -> None:
+    """Generate a registration-gap PDF report for a given user.
+
+    Always fetches live event logs from the server's configured event_log_path.
+    The PDF is saved automatically to reports/registration/<date>/.
+
+    \b
+    Examples:
+      ai-tools flexisip reg-gap --server prod  --username 762cbe93429d
+      ai-tools flexisip reg-gap --server stg2  --username abc123 --hours 48
+      ai-tools flexisip reg-gap --server prod2 --username abc123 --hours 0
+    """
+    srv = get_server(server)
+    click.echo(f"Server   : {srv.name}  ({srv.ssh_alias})", err=True)
+    click.echo(f"Username : {username}", err=True)
+    click.echo(f"Window   : {'all time' if hours == 0 else f'last {hours}h'}", err=True)
+    click.echo(f"Log path : {srv.event_log_path}", err=True)
+
+    try:
+        pdf_path = analyze_reg_gaps(
+            server=srv,
+            username=username,
+            hours=hours,
+            progress_cb=lambda msg: click.echo(msg, err=True),
+        )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo(f"PDF saved: {pdf_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,12 +1,14 @@
 """Registration Gap Analysis — fetch live event logs and generate a PDF report.
 
 Fetches registration event logs for a given username from any configured
-Flexisip server (stg2, stg2b, prod) and produces a colour-coded PDF report
-showing registration gaps, notable events, and summary statistics.
+Flexisip server (stg2, stg2b, prod, prod2) and produces a colour-coded PDF
+report showing registration gaps, notable events, and summary statistics.
 
 Usage:
     uv run python src/ai_tools/flexisip/reg_gap_analysis.py \\
         --server prod --username 762cbe93429d
+    uv run python src/ai_tools/flexisip/reg_gap_analysis.py \\
+        --server prod2 --username 762cbe93429d   # v2 production server
     uv run python src/ai_tools/flexisip/reg_gap_analysis.py \\
         --server stg2 --username abc123 --hours 48
     uv run python src/ai_tools/flexisip/reg_gap_analysis.py \\
@@ -51,14 +53,16 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Fetch live Flexisip event logs and generate a registration gap PDF report.",
     )
-    p.add_argument("--server", required=True, choices=["stg2", "stg2b", "prod"],
-                   help="Server to fetch event logs from.")
+    p.add_argument("--server", required=True, choices=["stg2", "stg2b", "prod", "prod2"],
+                   help="Server to fetch event logs from. prod2 = v2 production (latest changes).")
     p.add_argument("--username", required=True,
                    help="Username or AOR fragment to filter (e.g. 762cbe93429d).")
     p.add_argument("--hours", type=int, default=24,
                    help="Look-back window in hours. Use 0 for all available history. (default: 24)")
     p.add_argument("--output", default=None,
                    help="Output PDF path. Defaults to reports/<YYYY-MM-DD>/reg_gap_<server>_<user>_<ts>.pdf")
+    p.add_argument("--log-file", default=None,
+                   help="Path to a pre-fetched local log file. Skips SSH fetch when provided.")
     return p.parse_args()
 
 
@@ -100,17 +104,17 @@ def _is_unreg(verb: str, ip: str | None) -> bool:
 def _gap_color(secs: float):
     if secs < 120:
         return colors.HexColor("#FFAAAA")   # < 2 min: anomaly
-    if secs <= 2400:
-        return colors.HexColor("#AAFFAA")   # 2–40 min: normal
-    return colors.HexColor("#FFE599")       # > 40 min: large gap
+    if secs <= 3600:
+        return colors.HexColor("#AAFFAA")   # 2–60 min: normal (within expiry window)
+    return colors.HexColor("#FFE599")       # > 60 min: registration expired
 
 
 # ── PDF tables ────────────────────────────────────────────────────────────────
 def _build_legend() -> Table:
     rows = [
         ["", "< 2 min",    "Anomaly / rapid re-registration (network switch or reconnect burst)"],
-        ["", "2 – 40 min", "Normal periodic re-registration"],
-        ["", "> 40 min",   "Large gap — device offline, backgrounded, or missed heartbeat"],
+        ["", "2 – 60 min", "Normal periodic re-registration (within 60-min expiry window — safe)"],
+        ["", "> 60 min",   "Registration EXPIRED — gap exceeds 60-min expiry window (Kazoo removes after 63 min)"],
         ["", "Pink row",   "Explicit UNREGISTER / no-contact event"],
     ]
     t = Table(rows, colWidths=[0.5*cm, 2.5*cm, 13.3*cm])
@@ -178,14 +182,14 @@ def _build_stats_table(events: list[Event]) -> Table:
     gaps = [(reg_events[i][0] - reg_events[i-1][0]).total_seconds()
             for i in range(1, len(reg_events))]
     unreg_count = sum(1 for _, verb, ip, _ in events if _is_unreg(verb, ip))
-    rows = [["Total Events", "Unregs", "Avg Gap", "Min Gap", "Max Gap", "Large >40m", "Anomalies <2m"]]
+    rows = [["Total Events", "Unregs", "Avg Gap", "Min Gap", "Max Gap", "Expired >60m", "Anomalies <2m"]]
     rows.append([
         str(len(events)),
         str(unreg_count),
         _fmt_gap(statistics.mean(gaps)) if gaps else "—",
         _fmt_gap(min(gaps))             if gaps else "—",
         _fmt_gap(max(gaps))             if gaps else "—",
-        str(sum(1 for g in gaps if g > 2400)),
+        str(sum(1 for g in gaps if g > 3600)),
         str(sum(1 for g in gaps if 0 < g < 120)),
     ])
     col_widths = [2.6*cm, 1.8*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm]
@@ -210,14 +214,20 @@ def main() -> None:
     srv  = get_server(args.server)
 
     print(f"Server   : {srv.name}  ({srv.ssh_alias})", file=sys.stderr)
-    print(f"Log path : {srv.event_log_path}", file=sys.stderr)
     print(f"Username : {args.username}", file=sys.stderr)
     print(f"Window   : {'all time' if args.hours == 0 else f'last {args.hours}h'}", file=sys.stderr)
-    print("Fetching event logs...", file=sys.stderr)
 
-    raw = extract_event_logs(srv, pattern=args.username)
+    if args.log_file:
+        print(f"Log file : {args.log_file} (local, skipping SSH fetch)", file=sys.stderr)
+        raw = Path(args.log_file).read_text(encoding="utf-8", errors="replace")
+    else:
+        print(f"Log path : {srv.event_log_path}", file=sys.stderr)
+        print("Fetching event logs...", file=sys.stderr)
+        raw = extract_event_logs(srv, pattern=args.username)
+
     if not raw.strip():
-        print(f"No event logs found for '{args.username}' on {srv.name}.", file=sys.stderr)
+        src = args.log_file or srv.name
+        print(f"No event logs found for '{args.username}' in {src}.", file=sys.stderr)
         sys.exit(1)
 
     events = _parse_events(raw, args.username, args.hours)
@@ -292,9 +302,9 @@ def main() -> None:
         if _is_unreg(verb_prev, ip_prev):
             notable.append(f"[UNREGISTER] #{i} at {p_utc} ({p_ist}) — "
                            f"re-registered at {c_utc} ({c_ist}), gap: {_fmt_gap(g)}")
-        elif g > 2400:
-            notable.append(f"[Large gap] #{i}→#{i+1}: {p_utc} ({p_ist}) → "
-                           f"{c_utc} ({c_ist}) — {_fmt_gap(g)}")
+        elif g > 3600:
+            notable.append(f"[EXPIRED gap] #{i}→#{i+1}: {p_utc} ({p_ist}) → "
+                           f"{c_utc} ({c_ist}) — {_fmt_gap(g)} (registration expired)")
         elif 0 < g < 120:
             notable.append(f"[Rapid re-reg] #{i}→#{i+1}: {p_utc} ({p_ist}) → "
                            f"{c_utc} ({c_ist}) — {_fmt_gap(g)} (network handoff)")

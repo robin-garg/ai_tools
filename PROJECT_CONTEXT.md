@@ -77,15 +77,18 @@ one-off scripts. This keeps them reusable from:
 
 ## Flexisip Servers
 
-| Key | Domain / SSH alias | Environment | Policy |
-| --- | --- | --- | --- |
-| `stg2` | `stg2` | Staging | Full read/write — safe to experiment |
-| `stg2b` | `stg2b` | Staging | Full read/write — safe to experiment |
-| `prod` | `flexisip.e1a.aws.wlcomm.net` | **Production** | **READ-ONLY** — see policy below |
+| Key | SSH alias | Hostname | Environment | Policy |
+| --- | --- | --- | --- | --- |
+| `stg2` | `stg2` | `flexisip-stg2.e1a.stg2.wlclabs.net` | Staging | Full read/write — safe to experiment |
+| `stg2b` | `stg2b` | `flexisip-stg2b.e1a.stg2.wlclabs.net` | Staging | Full read/write — safe to experiment |
+| `prod` | `prod` | `flexisip.e1a.aws.wlcomm.net` | **Production (stable)** | **READ-ONLY** — see policy below |
+| `prod2` | `prod2` | `flexisip-v2.e1a.aws.wlcomm.net` | **Production (v2 / latest)** | **READ-ONLY** — same policy as `prod` |
 
-### ⚠️ Production server policy (`prod`)
+`prod2` runs the latest code changes and is used for validation before rolling out to `prod`. Both are live production servers with real traffic — the same strict read-only rules apply to both.
 
-The `prod` server is **production**. Strict read-only access only.
+### ⚠️ Production server policy (`prod` and `prod2`)
+
+Both `prod` and `prod2` are **production** servers. Strict read-only access only.
 
 #### ✅ Allowed (read-only)
 
@@ -93,11 +96,26 @@ The `prod` server is **production**. Strict read-only access only.
 | --- | --- |
 | **Redis** (`redis-cli`) | `GET`, `HGETALL`, `KEYS`, `SCAN`, `TTL`, `TYPE` — no writes |
 | **Flexisip socket** (`/tmp/flexisip-proxy-3`) | `REGISTRAR_GET`, `CONFIG_GET`, `CONFIG_LIST` — read-only queries only |
-| **Event logs** | `cat`, `tail`, `ls` on `/var/opt/belledonne-communications/log/flexisip/users/...` via `podman exec` |
-| **Proxy log** | `tail`, `cat`, `grep` on `/usr/local/var/log/flexisip/flexisip-proxy.log` via `podman exec` |
-| **Config file** | `cat`, `grep` on `/etc/flexisip/DEVOPS-32/flexisip.conf` |
+| **Event logs** | `cat`, `tail`, `ls` on `/var/log/flexisip/event-logs` via direct SSH (host filesystem) |
+| **Proxy log** | `tail`, `cat`, `grep` on `/var/log/flexisip/flexisip-proxy.log` via direct SSH (host filesystem) |
+- **`register-wakeup-interval`**: **5 minutes** (Scan frequency: the server checks for expiring contacts every 5 minutes).
+- **`register-wakeup-threshold`**: **20%** (Percentage of lifetime: Flexisip sends a wake-up push to any device that has already spent more than 20% of its registration lifetime).
+- **Rationale**: This aggressive threshold (re-registering after only 20% of time has passed) ensures that mobile devices stay "always-on" and reachable, even if they are heavily throttled by the OS background policies.
 
-#### ❌ Never allowed on production
+### Registration Expiry Window & Gap Severity
+
+| Gap Duration | Classification | Implication |
+| --- | --- | --- |
+| < 2 min | **Anomaly** | Rapid re-registration — network handoff, SIP 401 challenge, or duplicate |
+| 2 – 60 min | **Normal / Safe** | Within the 60-min expiry window — registration is still alive |
+| 40 – 60 min | **Approaching expiry** | Device is at risk if the next re-REGISTER doesn't arrive in time |
+| > 60 min | **Registration EXPIRED** | Flexisip has removed the contact; any inbound call during this window would trigger an expiration-notifier push wake-up |
+
+**Key numbers:**
+- **60 minutes** — registration expiry window (clean separation boundary used for gap analysis).
+- **63 minutes** — Kazoo's actual eviction time (3-minute buffer on top of the 60-min expiry). Kazoo does not remove the registration from its own side until 63 min have passed.
+- **Consequence**: Even if a device re-registers at 65 min, there is a ~5-min window (60–65 min) during which the contact is expired in Flexisip. Any INVITE arriving in that window will trigger an APNS/FCM expiration-notifier push rather than a direct SIP delivery.
+- **Gap analysis tools** (`event-logs` CLI and `reg_gap_analysis.py` PDF) use 60 min as the threshold: gaps ≤ 60 min are green (safe), gaps > 60 min are yellow (expired).
 
 - Any `CONFIG_SET`, `REGISTRAR_CLEAR`, `REGISTRAR_DELETE`, or other mutating Flexisip socket commands
 - Any `redis-cli SET`, `DEL`, `HSET`, `HDEL`, `EXPIRE`, or any write to Redis
@@ -107,7 +125,8 @@ The `prod` server is **production**. Strict read-only access only.
 
 #### 🔴 Abort rule
 
-If a task **cannot** be completed without making a change on `prod`:
+If a task **cannot** be completed without making a change on `prod` or `prod2`:
+
 1. **Stop immediately** — do not proceed
 2. **Inform the user** what would need to change and why
 3. **Wait for explicit approval** before doing anything
@@ -119,7 +138,7 @@ monitoring the server (e.g. `ps aux` inside the container). Even read-only
 scripts can alarm operators. Prefer simple one-liner commands over multi-line
 Python scripts when possible on production.
 
-SSH access: username `rgarg`, key `~/.ssh/id_ed25519`.
+SSH access (both `prod` and `prod2`): username `rgarg`, key `~/.ssh/id_ed25519`.
 
 ---
 
@@ -144,8 +163,9 @@ produce any log output worth analysing. Never treat it as a log source.
 
 | Log type | Location | How to fetch |
 | --- | --- | --- |
-| SIP call / registration proxy logs | Inside `flexisip-proxy` container: `/usr/local/var/log/flexisip/flexisip-proxy.log` | `docker exec` via `log_extractor.extract()` |
-| Registration event-logs | On the **host**: `/var/log/flexisip/event-logs` | Direct SSH via `log_extractor.extract_event_logs()` |
+| SIP proxy logs (`stg2`, `prod`) | Inside `flexisip-proxy` container: `/usr/local/var/log/flexisip/flexisip-proxy.log` | `docker exec` via `log_extractor.extract()` |
+| SIP proxy logs (`stg2b`, `prod2`) | On the **host**: `/var/log/flexisip/flexisip-proxy.log` | Direct SSH (`proxy_log_in_container=False`) |
+| Registration event-logs (all servers) | On the **host**: `/var/log/flexisip/event-logs` | Direct SSH via `log_extractor.extract_event_logs()` |
 
 ---
 

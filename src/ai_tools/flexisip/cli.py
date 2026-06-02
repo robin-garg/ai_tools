@@ -1001,10 +1001,10 @@ def event_logs(
             buckets["5-20 min"] += 1
         elif d < 2400:
             buckets["20-40 min"] += 1
-        elif d < 5400:
-            buckets["40-90 min"] += 1
+        elif d < 3600:
+            buckets["40-60 min"] += 1
         else:
-            buckets["> 90 min"] += 1
+            buckets["> 60 min"] += 1
 
     click.echo("")
     click.echo("=== Registration Gap Summary ===")
@@ -1016,7 +1016,7 @@ def event_logs(
     click.echo("")
     click.echo("=== Gap Distribution ===")
     for k in ["< 2s (burst)", "2-10s", "10-60s", "1-5 min",
-               "5-20 min", "20-40 min", "40-90 min", "> 90 min"]:
+               "5-20 min", "20-40 min", "40-60 min", "> 60 min"]:
         if buckets[k]:
             click.echo(f"  {k:<14}  {buckets[k]:>3}  {'#' * buckets[k]}")
 
@@ -1109,6 +1109,112 @@ def call_flow(
     click.echo(f"Markdown : {md_path}", err=True)
     click.echo(f"PDF      : {pdf_path}", err=True)
     click.echo(str(pdf_path))
+
+
+@flexisip.command("pcap")
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target Flexisip server.",
+)
+@click.option(
+    "--source", "-H",
+    "source_hosts",
+    multiple=True,
+    help=(
+        "Source IP(s) to filter on (e.g. Kazoo's IP). "
+        "Repeat for multiple IPs: -H 162.252.248.230 -H 162.252.251.67. "
+        "Omit to capture ALL SIP traffic on the port."
+    ),
+)
+@click.option(
+    "--port", "-p",
+    default=5060,
+    show_default=True,
+    type=int,
+    help="SIP port to capture on.",
+)
+@click.option(
+    "--iface", "-i",
+    default="any",
+    show_default=True,
+    help="Network interface on the remote host.",
+)
+@click.option(
+    "--save/--no-save",
+    default=True,
+    show_default=True,
+    help="Save captured output to logs/<server>_pcap_<utc>.log on stop.",
+)
+def pcap_cmd(
+    server: str,
+    source_hosts: tuple[str, ...],
+    port: int,
+    iface: str,
+    save: bool,
+) -> None:
+    """Capture live SIP packets on the remote host. Press Ctrl+C to stop.
+
+    Runs ``sudo tcpdump`` over SSH and streams every SIP packet to the
+    terminal in real-time.  When you press Ctrl+C the capture stops and the
+    full output is saved to the logs/ directory.
+
+    \b
+    Typical workflow:
+      1.  Run this command.
+      2.  Make the call from Kazoo.
+      3.  Press Ctrl+C.
+      4.  Inspect the saved log file to see whether the INVITE arrived.
+
+    \b
+    Examples:
+      # Capture all SIP on prod2 (broad — use when Kazoo IP is unknown)
+      ai-tools flexisip pcap -s prod2
+
+      # Narrow to Kazoo's two IPs (less noise)
+      ai-tools flexisip pcap -s prod2 -H 162.252.248.230 -H 162.252.251.67
+    """
+    from ai_tools.flexisip.pcap import run_pcap
+    from ai_tools.flexisip.log_extractor import save_to_logs_dir
+
+    srv = get_server(server)
+    hosts_list = list(source_hosts)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    click.echo("")
+    click.echo(f"SIP Packet Capture  —  {srv.name}")
+    click.echo(f"Interface : {iface}   Port : {port}")
+    if hosts_list:
+        click.echo(f"Filter    : {' | '.join(hosts_list)}")
+    else:
+        click.echo("Filter    : ALL hosts (no source IP filter)")
+    click.echo("Press Ctrl+C to stop the capture.")
+    click.echo("-" * 70)
+
+    # ── Capture ───────────────────────────────────────────────────────────────
+    lines, pkt_count = run_pcap(
+        srv,
+        iface=iface,
+        port=port,
+        source_hosts=hosts_list,
+        on_line=click.echo,
+    )
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    click.echo("-" * 70)
+    click.echo(f"Capture stopped.  Packets seen: {pkt_count}  |  Lines: {len(lines)}")
+
+    if not lines:
+        click.echo("(nothing captured)", err=True)
+        return
+
+    if save:
+        content = "\n".join(lines) + "\n"
+        saved = save_to_logs_dir(content, srv.name, "pcap")
+        click.echo(f"Saved to  : {saved}")
+    else:
+        click.echo("(--no-save: output not written to disk)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -9,14 +9,23 @@ Each server has:
 - `event_log_path`  : path to the registration event-logs *on the host*
                       filesystem (used via direct SSH, no container)
 
-PRODUCTION SERVER POLICY
-------------------------
-The "prod" entry below is the PRODUCTION server (flexisip.e1a.aws.wlcomm.net).
-Only READ operations are permitted on this server:
-  - Fetching registrations (Redis reads / SCAN)
-  - Fetching / tailing logs (docker exec, SSH cat/tail)
+PRODUCTION SERVER POLICY  (applies to BOTH "prod" and "prod2")
+--------------------------------------------------------------
+Only READ operations are permitted on production servers:
+  - Redis: GET, HGETALL, KEYS, SCAN, TTL, TYPE — no writes
+  - Flexisip socket: REGISTRAR_GET, CONFIG_GET, CONFIG_LIST — no mutations
+  - Logs: cat, tail, grep on log files via podman/docker exec or direct SSH
+
 NEVER make configuration changes, write to Redis, restart services, or perform
-any other mutating operation on the production server.
+any other mutating operation on any production server.
+If a task cannot be completed without a change → stop and ask the user first.
+
+Servers
+-------
+  prod   : flexisip.e1a.aws.wlcomm.net      — stable production
+  prod2  : flexisip-v2.e1a.aws.wlcomm.net   — v2 production (latest changes)
+  stg2   : flexisip-stg2.e1a.stg2.wlclabs.net  — staging (read/write OK)
+  stg2b  : flexisip-stg2b.e1a.stg2.wlclabs.net — staging (read/write OK)
 """
 
 from __future__ import annotations
@@ -52,7 +61,7 @@ SERVERS: dict[str, Server] = {
         name="stg2b",
         ssh_alias="stg2b",
         redis_host="flexisip-stg2b.y19cqc.ng.0001.use1.cache.amazonaws.com",
-        proxy_log_path="/usr/local/var/log/flexisip/flexisip-proxy.log",
+        proxy_log_path="/var/log/flexisip/flexisip-proxy.log",
         event_log_path="/var/log/flexisip/event-logs",
         proxy_log_in_container=False,   # log lives on the host filesystem (Podman host mount)
     ),
@@ -63,6 +72,16 @@ SERVERS: dict[str, Server] = {
         redis_host="ucaas-prod-flexisip-prod.qiser2.ng.0001.use1.cache.amazonaws.com",
         proxy_log_path="/usr/local/var/log/flexisip/flexisip-proxy.log",
         event_log_path="/var/log/flexisip/event-logs",
+    ),
+    # ⚠️  PRODUCTION v2 — READ-ONLY.  Same policy as "prod". Latest code changes.
+    # Proxy log and event-logs both live on the host filesystem (same layout as stg2b).
+    "prod2": Server(
+        name="prod2",
+        ssh_alias="prod2",
+        redis_host="ucaas-prod-flexisip-prod-v2.qiser2.ng.0001.use1.cache.amazonaws.com",
+        proxy_log_path="/var/log/flexisip/flexisip-proxy.log",
+        event_log_path="/var/log/flexisip/event-logs",
+        proxy_log_in_container=False,   # log lives on the host filesystem (same as stg2b)
     ),
 }
 

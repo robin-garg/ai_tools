@@ -82,6 +82,45 @@ uv run <command>              # run a command inside the project venv
 uv lock --upgrade             # upgrade dependency versions within constraints
 ```
 
+## Deployment
+
+To deploy this MCP server to another machine (e.g., a new laptop):
+
+1. **Clone the repository**:
+
+   ```bash
+   git clone <repo-url> ai_tools
+   cd ai_tools
+   ```
+
+2. **Run the install script**:
+
+   ```bash
+   ./scripts/install_mcp.sh
+   ```
+
+   This script will:
+    - Install `uv` if missing.
+    - Sync Python dependencies.
+    - Verify your `~/.ssh/config` for the required Flexisip host aliases (`stg2`, `stg2b`, `prod`, `prod2`).
+    - Provide the JSON configuration for your MCP client (e.g., Claude Desktop).
+
+3. **Configure SSH**:
+   Ensure you have SSH access to the Flexisip servers and that your `~/.ssh/config` has the correct aliases. The `install_mcp.sh` script will provide a template if they are missing.
+
+## MCP Server
+
+The project includes an MCP server that exposes Flexisip diagnostic tools.
+
+- **Entry point**: `flexisip-mcp` (defined in `pyproject.toml`)
+- **Transport**: stdio
+
+To run locally for testing:
+
+```bash
+uv run flexisip-mcp
+```
+
 ## Related projects
 
 - **`ai_tools_mcp`** *(planned, separate repo)* — MCP server exposing these

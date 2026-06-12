@@ -19,12 +19,13 @@ import click
 
 from ai_tools.flexisip.docker_utils import find_proxy_container, list_containers
 from ai_tools.flexisip.expiration_notifier import parse_notifier_log
+from ai_tools.flexisip.list_invites import list_invites
 from ai_tools.flexisip.log_extractor import (
     extract_and_save,
     extract_event_logs,
     save_to_logs_dir,
 )
-from ai_tools.flexisip.log_utils import fmt_gap
+from ai_tools.flexisip.log_utils import display_ts, fmt_gap
 from ai_tools.flexisip.reg_gap_analysis import analyze_reg_gaps
 from ai_tools.flexisip.registrar import (
     connect,
@@ -311,6 +312,15 @@ def containers(server: str) -> None:
     default=False,
     help="Also persist the extracted logs to logs/<server>_<desc>_<utc>.log.",
 )
+@click.option(
+    "--log-path",
+    default=None,
+    help=(
+        "Override proxy log path on the server (e.g. a rotated "
+        "'flexisip-proxy.log-YYYYMMDD.gz' file). '.gz' paths are "
+        "auto-streamed through zcat."
+    ),
+)
 def logs(
     server: str,
     call_id: str | None,
@@ -318,6 +328,7 @@ def logs(
     start: str | None,
     end: str | None,
     save: bool,
+    log_path: str | None,
 ) -> None:
     """Extract Flexisip proxy call logs and print them to stdout.
 
@@ -352,6 +363,8 @@ def logs(
         pattern = ""
         descriptor = f"range-{(start or 'open').replace(' ', 'T')}"
 
+    if log_path:
+        click.echo(f"using log path: {log_path}", err=True)
     click.echo("extracting logs...", err=True)
     result = extract_and_save(
         srv,
@@ -361,6 +374,7 @@ def logs(
         start=start or "",
         end=end or "",
         save=save,
+        log_path=log_path,
     )
 
     # Summary goes to stderr so stdout stays clean for piping / analysis.
@@ -1373,6 +1387,122 @@ def reg_gap(server: str, username: str, hours: int) -> None:
         sys.exit(1)
 
     click.echo(f"PDF saved: {pdf_path}")
+
+
+@flexisip.command("list-invites")
+@click.option(
+    "--server", "-s",
+    type=SERVER_CHOICE,
+    required=True,
+    help="Target server (stg2, stg2b, prod, prod2).",
+)
+@click.option(
+    "--start",
+    required=True,
+    help="Start timestamp UTC, 'YYYY-MM-DD HH:MM:SS'.",
+)
+@click.option(
+    "--end",
+    required=True,
+    help="End timestamp UTC, 'YYYY-MM-DD HH:MM:SS'.",
+)
+@click.option(
+    "--from-user", "from_filter",
+    default=None,
+    help="Filter by caller SIP user (case-insensitive substring on From URI).",
+)
+@click.option(
+    "--to-user", "to_filter",
+    default=None,
+    help="Filter by callee target (case-insensitive substring on Request-URI).",
+)
+@click.option(
+    "--log-path",
+    default=None,
+    help=(
+        "Override proxy log path on the server (e.g. a rotated "
+        "'flexisip-proxy.log-YYYYMMDD.gz' file). '.gz' paths are "
+        "auto-streamed through zcat."
+    ),
+)
+def list_invites_cmd(
+    server: str,
+    start: str,
+    end: str,
+    from_filter: str | None,
+    to_filter: str | None,
+    log_path: str | None,
+) -> None:
+    """List all inbound INVITEs that reached Flexisip in a UTC time window.
+
+    First-line triage for failed-call investigations: shows every
+    ``Receiving new Request SIP message INVITE`` block between --start and
+    --end, with Call-ID, From, To, CSeq, User-Agent and source IP — enough
+    to decide which call to drill into further.
+
+    \b
+    Examples:
+      ai-tools flexisip list-invites -s prod2 \\
+          --start "2026-06-03 14:50:00" --end "2026-06-03 15:10:00"
+
+      ai-tools flexisip list-invites -s stg2b \\
+          --start "2026-06-03 14:50:00" --end "2026-06-03 15:10:00" \\
+          --from-user 1311
+    """
+    srv = get_server(server)
+    if srv.proxy_log_in_container:
+        click.echo(f"resolving proxy container on {srv.name}...", err=True)
+        container_name = find_proxy_container(srv).name
+        click.echo(f"using container: {container_name}", err=True)
+    else:
+        container_name = ""
+        click.echo(f"proxy log is on host filesystem ({srv.proxy_log_path})", err=True)
+
+    if log_path:
+        click.echo(f"using log path: {log_path}", err=True)
+    click.echo("extracting INVITE blocks...", err=True)
+    entries = list_invites(
+        srv,
+        container=container_name,
+        start=start,
+        end=end,
+        from_filter=from_filter or "",
+        to_filter=to_filter or "",
+        log_path=log_path,
+    )
+
+    now_utc = datetime.now(tz=timezone.utc)
+    click.echo("")
+    click.echo(f"Inbound INVITEs  —  {srv.name}")
+    click.echo(f"Window      : {start} → {end} UTC")
+    active = {k: v for k, v in (("from", from_filter), ("to", to_filter)) if v}
+    if active:
+        click.echo("Filters     : " + "  ".join(f"{k}={v}" for k, v in active.items()))
+    click.echo(f"Report time : {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    click.echo(f"Total       : {len(entries)} INVITE(s)")
+    _sep()
+
+    if not entries:
+        click.echo("No INVITEs found in the requested window.")
+        return
+
+    w_from = max(len(e.from_user) for e in entries) or 4
+    w_src  = max(len(e.source_ip_port) for e in entries) or 9
+
+    click.echo(
+        f"{'#':<3}  {'Time (UTC)':<12}  {'From':<{w_from}}  "
+        f"{'Source IP:Port':<{w_src}}  {'CSeq':<14}  Call-ID  →  Request-URI"
+    )
+    _sep()
+    for i, e in enumerate(entries, 1):
+        click.echo(
+            f"{i:<3}  {display_ts(e.timestamp):<12}  {e.from_user:<{w_from}}  "
+            f"{e.source_ip_port:<{w_src}}  {e.cseq:<14}  {e.call_id}"
+        )
+        click.echo(f"     → {e.request_uri}")
+        if e.user_agent:
+            click.echo(f"     UA: {e.user_agent}")
+    _sep()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

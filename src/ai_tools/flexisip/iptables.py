@@ -21,7 +21,7 @@ def block_ip(
     *,
     port: int = 5060,
     proto: str = "udp",
-    chain: str = "INPUT",
+    chain: str = "FORWARD",
     dry_run: bool = False,
 ) -> str:
     """Insert an iptables DROP rule for *ip* on the remote server.
@@ -67,7 +67,7 @@ def unblock_ip(
     *,
     port: int = 5060,
     proto: str = "udp",
-    chain: str = "INPUT",
+    chain: str = "FORWARD",
     dry_run: bool = False,
 ) -> str:
     """Remove an iptables DROP rule for *ip* on the remote server.
@@ -114,7 +114,7 @@ def unblock_ip(
 
 def list_rules(
     server: Server,
-    chain: str = "INPUT",
+    chain: str = "FORWARD",
 ) -> str:
     """Return the current iptables rules for *chain* on the remote server.
 

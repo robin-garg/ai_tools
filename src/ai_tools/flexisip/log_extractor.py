@@ -127,24 +127,41 @@ def extract(
     * ``False`` — the proxy log is on the host filesystem; ``awk`` is run
                   directly over SSH.  ``container`` is ignored.
 
-    ``log_path`` overrides ``server.proxy_log_path`` when given.
+    ``log_path`` overrides ``server.proxy_log_path`` when given.  When the
+    resolved path ends in ``.gz`` the file is streamed through ``zcat`` before
+    being fed to ``awk`` so rotated/historical logs can be scanned without
+    decompressing them on disk.
     """
     resolved_path = log_path or server.proxy_log_path
+    is_gz = resolved_path.endswith(".gz")
+    awk_vars = (
+        f"-v pat={shlex.quote(pattern)} "
+        f"-v start={shlex.quote(start)} "
+        f"-v end={shlex.quote(end)}"
+    )
+    awk_script = shlex.quote(_AWK_EXTRACTOR)
+    quoted_path = shlex.quote(resolved_path)
     if server.proxy_log_in_container:
+        if is_gz:
+            inner = (
+                f"zcat {quoted_path} | awk {awk_vars} {awk_script}"
+            )
+        else:
+            inner = f"awk {awk_vars} {awk_script} {quoted_path}"
         remote_cmd = (
             f"sudo -n docker exec {shlex.quote(container)} "
-            f"awk -v pat={shlex.quote(pattern)} "
-            f"-v start={shlex.quote(start)} "
-            f"-v end={shlex.quote(end)} "
-            f"{shlex.quote(_AWK_EXTRACTOR)} {shlex.quote(resolved_path)}"
+            f"sh -c {shlex.quote(inner)}"
         )
     else:
-        remote_cmd = (
-            f"sudo -n awk -v pat={shlex.quote(pattern)} "
-            f"-v start={shlex.quote(start)} "
-            f"-v end={shlex.quote(end)} "
-            f"{shlex.quote(_AWK_EXTRACTOR)} {shlex.quote(resolved_path)}"
-        )
+        if is_gz:
+            remote_cmd = (
+                f"sudo -n zcat {quoted_path} | "
+                f"awk {awk_vars} {awk_script}"
+            )
+        else:
+            remote_cmd = (
+                f"sudo -n awk {awk_vars} {awk_script} {quoted_path}"
+            )
     result = subprocess.run(
         ["ssh", server.ssh_alias, remote_cmd],
         capture_output=True,
